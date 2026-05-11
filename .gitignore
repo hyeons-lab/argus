@@ -1,0 +1,16 @@
+# Rust
+target/
+**/*.rs.bk
+
+# macOS
+.DS_Store
+
+# Local-only devlog (per workflow)
+devlog/
+
+# Git worktrees (per workflow)
+worktrees/
+
+# Editor
+*.swp
+*.swo

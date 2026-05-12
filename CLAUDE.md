@@ -10,7 +10,7 @@ Argus is an attention-routing terminal supervisor: a long-running Rust daemon, a
   - `argus-tui` — Ratatui local client (terminal-mode)
   - `argus-web` — WebSocket transport adapter, server-side (consumed by Flutter clients)
   - `argus-mcp` — MCP server (stdio + optional TCP)
-- `flutter/argus_client/` — Flutter app (scaffolded in Phase 4)
+- `flutter/argus_client/` — Flutter app (scaffolded after the local daemon/TUI and remote web path are proven)
 - `devlog/` — **local-only**, gitignored. Branch devlogs and per-task plans.
 - `worktrees/` — gitignored.
 

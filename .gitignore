@@ -5,9 +5,6 @@ target/
 # macOS
 .DS_Store
 
-# Local-only devlog (per workflow)
-devlog/
-
 # Git worktrees (per workflow)
 worktrees/
 

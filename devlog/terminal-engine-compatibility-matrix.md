@@ -14,7 +14,7 @@ Both candidates pass a minimal compile spike in `argus-test-support`:
 - `wezterm_engine_spike.rs` instantiates upstream Git-pinned `wezterm-term`, feeds chunked PTY bytes with `advance_bytes`, and verifies size/sequence/screen state access.
 - `alacritty_engine_spike.rs` instantiates crates.io `alacritty_terminal`, feeds the same style of chunked PTY bytes through `vte::ansi::Processor`, and verifies grid dimensions/display state.
 
-The upstream WezTerm Git path is materially heavier: adding the dependency locked 201 packages and fetched WezTerm submodules including zlib, libpng, freetype, and harfbuzz. That is not a semantic blocker, but it is a build and CI cost that Phase 2 should revisit before making WezTerm a production dependency.
+The upstream WezTerm Git path is materially heavier: adding the dependency locked 201 packages, including image, font, Unicode, URL, and parser-related crates that are not needed by the current default test path. During the initial manual Git fetch, Git also reported updating upstream submodules from the WezTerm repository; Cargo's locked dependency graph itself is the concrete CI cost captured here. That is not a semantic blocker, but it is a build and maintenance cost that Phase 2 should revisit before making WezTerm a production dependency.
 
 ## Compatibility Matrix
 

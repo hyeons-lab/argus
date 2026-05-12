@@ -253,11 +253,11 @@ pause_all          = "ctrl+shift+p"
 Daemon-first. Local navigation first. Remote access once the local product is worth using from anywhere.
 
 ### Phase 0: Tooling & Architecture
-- [ ] Cargo workspace under `crates/`: `argus-core` (session trait + shared types), `argus-daemon` (state owner), `argus-tui` (Ratatui local client), `argus-web` (WebSocket transport adapter, server-side), `argus-mcp` (MCP server). Flutter app at `flutter/argus_client/` (outside the Cargo workspace, scaffolded in Phase 4).
-- [ ] `tracing` to `~/.local/state/argus/argus.log`.
-- [ ] TOML config parser.
-- [ ] CI: fmt, clippy, check, and test on Linux; workspace tests on macOS.
-- [ ] Test harness: golden snapshots for renderers; virtual terminal fixtures for PTY/session logic. **Set this up early** — TUI/PTY code is notoriously hard to test retroactively.
+- [x] Cargo workspace under `crates/`: `argus-core` (session trait + shared types), `argus-daemon` (state owner), `argus-tui` (Ratatui local client), `argus-web` (WebSocket transport adapter, server-side), `argus-mcp` (MCP server). Flutter app at `flutter/argus_client/` (outside the Cargo workspace, scaffolded in Phase 4).
+- [x] `tracing` to `~/.local/state/argus/argus.log`.
+- [x] TOML config parser.
+- [x] CI: fmt, clippy, check, and test on Linux; workspace tests on macOS.
+- [x] Test harness: golden snapshots for renderers; virtual terminal fixtures for PTY/session logic. **Set this up early** — TUI/PTY code is notoriously hard to test retroactively.
 
 ### Phase 1: Terminal Engine Acceptance
 - [ ] Engine spike (`wezterm-term` vs `alacritty_terminal`) with a written compatibility matrix.

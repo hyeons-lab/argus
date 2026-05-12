@@ -41,11 +41,10 @@ fn visible_rows(terminal: &Terminal) -> Vec<String> {
         .lines_in_phys_range(start..end)
         .iter()
         .map(|line| {
-            let mut row = String::new();
-            for cell in line.visible_cells() {
-                row.push_str(cell.str());
-            }
-            row.trim_end().to_owned()
+            let mut row = line.as_str();
+            let trimmed_len = row.trim_end().len();
+            row.to_mut().truncate(trimmed_len);
+            row.into_owned()
         })
         .collect()
 }
@@ -114,7 +113,7 @@ fn wezterm_term_visible_snapshots_cover_acceptance_scenarios() {
 }
 
 #[test]
-fn wezterm_term_chunked_replay_matches_visible_snapshot() {
+fn wezterm_term_chunked_replay_equivalence() {
     for scenario in SCENARIOS {
         assert_eq!(
             visible_rows(&feed_contiguous(*scenario)),

@@ -1,6 +1,6 @@
 use alacritty_terminal::event::VoidListener;
 use alacritty_terminal::grid::Dimensions;
-use alacritty_terminal::index::{Column, Line};
+use alacritty_terminal::index::Line;
 use alacritty_terminal::term::{Config, Term};
 use alacritty_terminal::vte::ansi;
 use argus_test_support::terminal_acceptance::{SCENARIOS, TerminalScenario};
@@ -39,13 +39,17 @@ fn terminal() -> Term<VoidListener> {
 }
 
 fn visible_rows(terminal: &Term<VoidListener>) -> Vec<String> {
+    let grid = terminal.grid();
+
     (0..terminal.screen_lines())
         .map(|row| {
-            (0..terminal.columns())
-                .map(|column| terminal.grid()[Line(row as i32)][Column(column)].c)
-                .collect::<String>()
-                .trim_end()
-                .to_owned()
+            let mut row: String = grid[Line(row as i32)][..]
+                .iter()
+                .map(|cell| cell.c)
+                .collect();
+            let trimmed_len = row.trim_end().len();
+            row.truncate(trimmed_len);
+            row
         })
         .collect()
 }
@@ -114,7 +118,7 @@ fn alacritty_terminal_visible_snapshots_cover_acceptance_scenarios() {
 }
 
 #[test]
-fn alacritty_terminal_chunked_replay_matches_visible_snapshot() {
+fn alacritty_terminal_chunked_replay_equivalence() {
     for scenario in SCENARIOS {
         assert_eq!(
             visible_rows(&feed_contiguous(*scenario)),

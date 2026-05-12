@@ -1,0 +1,18 @@
+use argus_test_support::snapshots::{frame, normalize_text};
+
+#[test]
+fn renderer_golden_snapshot_is_normalized() {
+    let frame = frame([
+        "Argus",
+        "repo: hyeons-lab/argus",
+        "attention: awaiting-input",
+        "",
+    ]);
+
+    insta::assert_snapshot!("sample_renderer_frame", frame);
+}
+
+#[test]
+fn text_normalization_is_platform_stable() {
+    assert_eq!(normalize_text("one\r\ntwo\rthree\n"), "one\ntwo\nthree");
+}

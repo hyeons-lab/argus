@@ -1,0 +1,17 @@
+[package]
+name = "argus-test-support"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+vte.workspace = true
+
+[dev-dependencies]
+insta.workspace = true

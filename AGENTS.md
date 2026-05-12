@@ -16,7 +16,7 @@ Argus is an attention-routing terminal supervisor: a long-running Rust daemon, a
 
 ## Devlog conventions
 
-Devlogs are checked in. Write devlog files at the repo root (`/path/to/argus/devlog/`), **not** inside worktrees — worktrees are independent working trees and untracked files don't propagate between them until copied or committed from the intended branch.
+Devlogs are checked in. Write devlog files at the repository root (`devlog/`) within your current worktree so they can be included in your branch commits.
 
 - **Branch devlog:** `devlog/NNNNNN-<branch-name>.md` — one file per branch. `NNNNNN` is a zero-padded 6-digit sequence (check the highest in `devlog/` and increment). `<branch-name>` is the git branch with `/` replaced by `-`.
 - **Plan file:** `devlog/plans/NNNNNN-NN-<description>.md`. `NN` is the per-branch plan sequence (01, 02, ...). Plan files use `## Thinking` then `## Plan` sections; plans are append-only.

@@ -9,7 +9,7 @@ Bootstrap the Argus repository and execute Phase 0 of the design-doc roadmap: Ca
 ## Progress
 
 - [x] Repo created (`hyeons-lab/argus`, public, Apache 2.0)
-- [x] Devlog placement set to local-only (repo root, not worktrees)
+- [x] Devlog placement initially set to local-only (historical; changed by `docs/check-in-devlogs`)
 - [x] Design doc moved to `devlog/argus-design-doc.md`; Phase 0 line updated for the new crate shape
 - [x] `chore/initial-scaffold` worktree created at `worktrees/chore-initial-scaffold`
 - [x] Project `CLAUDE.md` drafted
@@ -18,13 +18,13 @@ Bootstrap the Argus repository and execute Phase 0 of the design-doc roadmap: Ca
 - [x] Phase 0 step 2 plan (`devlog/plans/000001-02-tracing.md`)
 - [x] `tracing` wiring → `~/.local/state/argus/argus.log`
 - [x] Self-review + 11 fixes + rebase to 2 logical commits
-- [ ] TOML config parser per design-doc §9 (plan 000001-03)
-- [ ] Test harness — `insta` snapshots + `vte` virtual terminal (plan 000001-04)
-- [ ] CI workflow — fmt + clippy + test on Linux and macOS (plan 000001-05)
+- [ ] TOML config parser per design-doc §9 (later plan `devlog/plans/000002-01-config-parser.md`)
+- [ ] Test harness — `insta` snapshots + `vte` virtual terminal (later plan `devlog/plans/000003-01-test-harness.md`)
+- [ ] CI workflow — fmt + clippy + test on Linux and macOS (landed in PR #3; no checked-in plan file)
 
 ## What Changed
 
-2026-05-11T12:58-0700 README.md, LICENSE, .gitignore — initial commit on main. License adapted from sibling repo prism; gitignore makes `devlog/` and `worktrees/` local-only.
+2026-05-11T12:58-0700 README.md, LICENSE, .gitignore — initial commit on main. License adapted from sibling repo prism; at the time, gitignore made `devlog/` and `worktrees/` local-only. The `devlog/` policy later changed in `docs/check-in-devlogs`.
 2026-05-11T12:58-0700 devlog/argus-design-doc.md — moved from a local planning document; Phase 0 crate line updated to add `argus-core` and clarify `argus-web` as the server-side WebSocket transport adapter, with the Flutter app at `flutter/argus_client/` outside the workspace.
 2026-05-11T15:30-0700 CLAUDE.md — project conventions for coding agents (layout, devlog rules, Conventional Commits, worktree flow, plan-first flow, CI minimization, build/test commands, style guardrails).
 2026-05-11T15:30-0700 Cargo.toml, Cargo.lock, rust-toolchain.toml, crates/* — five-crate workspace bootstrap. Edition 2024, resolver 3, Apache-2.0 + per-crate descriptions, authors with email. Workspace lints: `unsafe_code = "deny"` (rust) and `clippy::all = "warn"`. Toolchain pinned to 1.94.1 with rustfmt + clippy.
@@ -33,7 +33,7 @@ Bootstrap the Argus repository and execute Phase 0 of the design-doc roadmap: Ca
 
 ## Decisions
 
-2026-05-11T12:58-0700 Devlogs are local-only — User directive ("keep devlogs local"). Reason: this project's devlog content initially stayed outside git. How to apply: write all devlog/plan files at `argus/devlog/...`, never inside `worktrees/<branch>/devlog/`, since untracked files don't propagate between worktrees.
+2026-05-11T12:58-0700 Devlogs are local-only — Historical policy from the initial scaffold. User directive at the time: "keep devlogs local." Reason: this project's devlog content initially stayed outside git. Superseded by `docs/check-in-devlogs`, which makes `devlog/` checked-in repository content.
 
 2026-05-11T12:58-0700 Workspace adds `argus-core` — Design doc commits to "one API, many transports" (§1) and a Rust trait + types for the session interface (§2). `argus-daemon` implements that trait; `argus-tui` / `argus-web` / `argus-mcp` consume it. Empty crate now means the dep graph is correct from day one.
 

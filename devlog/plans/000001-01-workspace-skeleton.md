@@ -71,9 +71,9 @@ None blocking. Tracked for later:
 ## Out of scope (follow-up plans on this branch)
 
 - `tracing` wiring to `~/.local/state/argus/argus.log` → `devlog/plans/000001-02-tracing.md`
-- TOML config parser per design-doc §9 → `devlog/plans/000001-03-config.md`
-- Test harness — `insta` snapshots + `vte` virtual terminal → `devlog/plans/000001-04-test-harness.md`
-- CI — fmt + clippy + test on Linux and macOS → `devlog/plans/000001-05-ci.md`
+- TOML config parser per design-doc §9 → `devlog/plans/000002-01-config-parser.md`
+- Test harness — `insta` snapshots + `vte` virtual terminal → `devlog/plans/000003-01-test-harness.md`
+- CI — fmt + clippy + test on Linux and macOS → landed in PR #3; no checked-in plan file was imported.
 
 ## Amendment — 2026-05-11
 

@@ -17,6 +17,7 @@ Move the existing devlogs into the repository, make `AGENTS.md` the canonical ag
 - Redacted a personal absolute path and personal-name wording from the copied devlog content.
 - Scanned devlogs for obvious secrets, emails, personal paths, personal-name markers, and token patterns before committing.
 - Marked Phase 0 complete in the checked-in design doc roadmap.
+- Addressed review feedback about checked-in devlog placement, historical local-only wording, and stale plan references.
 
 ## Decisions
 
@@ -27,7 +28,8 @@ Move the existing devlogs into the repository, make `AGENTS.md` the canonical ag
 ## Commits
 
 - 84c5389 — docs: check in devlogs
-- HEAD — docs: mark phase zero complete
+- 9a57146 — docs: mark phase zero complete
+- HEAD — docs: address devlog review feedback
 
 ## Progress
 
@@ -35,3 +37,4 @@ Move the existing devlogs into the repository, make `AGENTS.md` the canonical ag
 - 2026-05-11T23:21-0700 — Copied devlogs into the worktree, added `AGENTS.md`, and made `CLAUDE.md` defer to it.
 - 2026-05-11T23:21-0700 — Safety scan found no literal secrets, API keys, emails, or personal absolute paths after redaction.
 - 2026-05-11T23:32-0700 — Marked Phase 0 roadmap items complete so the design doc points at Phase 1 as the next implementation phase.
+- 2026-05-12T00:01-0700 — Addressed PR review comments by updating checked-in devlog guidance and replacing stale historical plan references.

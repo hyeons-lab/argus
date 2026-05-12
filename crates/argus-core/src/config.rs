@@ -40,6 +40,7 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<()> {
+        self.general.validate()?;
         self.ui.validate()?;
         self.attention.validate()?;
         self.agents.validate()?;
@@ -56,6 +57,12 @@ impl Config {
 #[serde(default, deny_unknown_fields)]
 pub struct GeneralConfig {
     pub default_shell: String,
+}
+
+impl GeneralConfig {
+    fn validate(&self) -> Result<()> {
+        ensure_non_empty("general.default_shell", &self.default_shell)
+    }
 }
 
 impl Default for GeneralConfig {
@@ -252,9 +259,13 @@ impl GrpcConfig {
     }
 
     fn validate(&self) -> Result<()> {
-        self.bind_addr()?;
-        if let Some(bind) = &self.bind {
-            ensure_non_empty("grpc.bind", bind)?;
+        match (self.enabled, &self.bind) {
+            (true, None) => bail!("grpc.bind must be set when grpc.enabled is true"),
+            (_, Some(bind)) => {
+                ensure_non_empty("grpc.bind", bind)?;
+                self.bind_addr()?;
+            }
+            (false, None) => {}
         }
         Ok(())
     }
@@ -518,6 +529,40 @@ search = " "
     }
 
     #[test]
+    fn empty_default_shell_fails_validation() {
+        let error = Config::from_toml_str(
+            r#"
+[general]
+default_shell = " "
+"#,
+        )
+        .expect_err("empty default shell should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("general.default_shell must not be empty")
+        );
+    }
+
+    #[test]
+    fn enabled_grpc_requires_bind() {
+        let error = Config::from_toml_str(
+            r#"
+[grpc]
+enabled = true
+"#,
+        )
+        .expect_err("enabled grpc without bind should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("grpc.bind must be set when grpc.enabled is true")
+        );
+    }
+
+    #[test]
     fn loads_from_path() {
         let unique = format!(
             "argus-config-test-{}-{}.toml",
@@ -533,6 +578,8 @@ default_shell = "/bin/bash"
 "#,
         )
         .expect("test config should be written");
+        file.flush().expect("test config should be flushed");
+        drop(file);
 
         let config = Config::load_from_path(&path).expect("config should load from path");
         std::fs::remove_file(&path).expect("test config file should be removed");

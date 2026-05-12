@@ -139,7 +139,7 @@ impl Perform for Transcript {
         match byte {
             b'\n' => self.plain_text.push('\n'),
             b'\t' => self.plain_text.push('\t'),
-            b'\r' => {}
+            b'\r' => self.plain_text.push('\r'),
             _ => {}
         }
         self.events.push(Event::Execute(byte));

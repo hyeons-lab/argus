@@ -14,5 +14,10 @@ fn renderer_golden_snapshot_is_normalized() {
 
 #[test]
 fn text_normalization_is_platform_stable() {
-    assert_eq!(normalize_text("one\r\ntwo\rthree\n"), "one\ntwo\nthree");
+    assert_eq!(normalize_text("one\r\ntwo\rthree\n"), "one\ntwo\nthree\n");
+}
+
+#[test]
+fn frame_preserves_intentional_final_blank_rows() {
+    assert_eq!(frame(["one", ""]), "one\n");
 }

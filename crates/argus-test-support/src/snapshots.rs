@@ -7,9 +7,5 @@ pub fn frame<'line>(lines: impl IntoIterator<Item = &'line str>) -> String {
 
 /// Normalize platform-specific and terminal-originated newlines.
 pub fn normalize_text(input: &str) -> String {
-    input
-        .replace("\r\n", "\n")
-        .replace('\r', "\n")
-        .trim_end_matches('\n')
-        .to_string()
+    input.replace("\r\n", "\n").replace('\r', "\n")
 }

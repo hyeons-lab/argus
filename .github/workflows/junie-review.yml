@@ -1,0 +1,37 @@
+name: Junie Review
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, ready_for_review]
+  workflow_dispatch:
+
+concurrency:
+  group: junie-review-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  review:
+    name: Review Pull Request
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        # actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          fetch-depth: 1
+
+      - name: Run Junie review
+        # JetBrains/junie-github-action@v1.4.1
+        uses: JetBrains/junie-github-action@f36d694fb571e0c0103d14bfa818a7ff1d1d35ed
+        with:
+          junie_api_key: ${{ secrets.JUNIE_API_KEY }}
+          prompt: code-review
+          use_single_comment: true

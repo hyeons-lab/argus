@@ -5,4 +5,5 @@
 //! place so future daemon, TUI, and transport tests exercise the same behavior.
 
 pub mod snapshots;
+pub mod terminal_acceptance;
 pub mod vt;

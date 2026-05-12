@@ -30,6 +30,10 @@ Implementation order:
 
 Early development. Not yet usable.
 
+## Testing
+
+The workspace includes `argus-test-support`, a non-published crate for reusable acceptance-test helpers. It provides renderer snapshot normalization and VT byte-stream fixtures so terminal engine, daemon session, and TUI behavior can be tested with deterministic golden outputs.
+
 ## License
 
 Apache License 2.0 — see [LICENSE](LICENSE).

@@ -1,5 +1,6 @@
 [package]
 name = "argus-test-support"
+description = "Reusable acceptance-test helpers for Argus renderer snapshots and terminal byte streams."
 edition.workspace = true
 version.workspace = true
 license.workspace = true

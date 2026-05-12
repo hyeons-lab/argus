@@ -567,7 +567,10 @@ enabled = true
         let unique = format!(
             "argus-config-test-{}-{}.toml",
             std::process::id(),
-            std::thread::current().name().unwrap_or("unnamed")
+            std::time::UNIX_EPOCH
+                .elapsed()
+                .expect("system clock should be after Unix epoch")
+                .as_nanos()
         );
         let path = std::env::temp_dir().join(unique);
         let mut file = std::fs::File::create(&path).expect("test config file should be created");

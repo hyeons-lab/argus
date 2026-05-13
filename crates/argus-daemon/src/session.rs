@@ -250,12 +250,13 @@ impl SessionActor {
 
     pub fn shutdown(mut self) -> Result<CompletedSession> {
         let (tx, rx) = mpsc::channel();
-        self.tx
+        let result = self
+            .tx
             .send(ActorCommand::Shutdown { response: tx })
-            .context("sending session shutdown command")?;
-        let completed = recv_actor_result(rx, "shutting down session")?;
+            .context("sending session shutdown command")
+            .and_then(|_| recv_actor_result(rx, "shutting down session"));
         self.join_threads();
-        Ok(completed)
+        result
     }
 
     fn join_threads(&mut self) {

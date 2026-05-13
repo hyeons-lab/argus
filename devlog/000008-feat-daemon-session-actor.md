@@ -20,6 +20,7 @@ Extend the daemon PTY session core from a one-shot drain helper into a long-runn
 - 2026-05-12T22:45-0700 — Added a daemon-local session actor handle with PTY input, resize, snapshot, shutdown, and daemon-owned output sequence tracking.
 - 2026-05-12T22:45-0700 — Verified the actor against a long-running shell that accepts injected input, updates visible terminal rows, reports resized dimensions, and shuts down cleanly.
 - 2026-05-13T01:25-0700 — Addressed PR review comments by sharing PTY spawn/output ingestion, preserving full error context through actor responses, bounding output backpressure, and making shutdown drain and joins bounded.
+- 2026-05-13T01:48-0700 — Addressed follow-up PR feedback so explicit shutdown joins actor threads even when sending or receiving the shutdown response fails.
 
 ## What Changed
 
@@ -31,6 +32,7 @@ Extend the daemon PTY session core from a one-shot drain helper into a long-runn
 - Shared PTY runtime setup and output ingestion between `PtySession` and `SessionActor`.
 - Kept actor command delivery separate from bounded PTY output delivery so chatty sessions cannot block control commands.
 - Added a regression test for retrieving final actor state after PTY output closes.
+- Ensured `SessionActor::shutdown` always attempts bounded thread joins after issuing the shutdown request.
 
 ## Validation
 
@@ -49,4 +51,5 @@ Extend the daemon PTY session core from a one-shot drain helper into a long-runn
 ## Commits
 
 - 1daebdf — feat: add daemon session actor
-- HEAD — fix: address session actor review comments
+- 932ad1e — fix: address session actor review comments
+- HEAD — fix: join session actor threads after shutdown errors

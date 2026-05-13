@@ -260,14 +260,14 @@ Daemon-first. Local navigation first. Remote access once the local product is wo
 - [x] Test harness: golden snapshots for renderers; virtual terminal fixtures for PTY/session logic. **Set this up early** — TUI/PTY code is notoriously hard to test retroactively.
 
 ### Phase 1: Terminal Engine Acceptance
-- [ ] Engine spike (`wezterm-term` vs `alacritty_terminal`) with a written compatibility matrix.
-- [ ] Verify resize, late attach, reconnect, alt-screen, bracketed paste, mouse reporting, scroll regions, replay, and log tee behavior.
-- [ ] Decide and document the canonical daemon state model.
+- [x] Engine spike (`wezterm-term` vs `alacritty_terminal`) with a written compatibility matrix.
+- [x] Verify resize, late attach, reconnect, alt-screen, bracketed paste, mouse reporting, scroll regions, replay, and log tee behavior.
+- [x] Decide and document the canonical daemon state model.
 
 ### Phase 2: Daemon Session Core
-- [ ] PTY spawning via `portable-pty`.
+- [x] PTY spawning via `portable-pty`.
 - [ ] Session actor owns PTY I/O, canonical VT state, scrollback sequence numbers, resize state, and metadata.
-- [ ] Per-session log tee.
+- [x] Per-session log tee.
 - [ ] Define attach modes: observer, interactive controller, and agent controller.
 - [ ] Implement input lease/takeover semantics and broadcast lease changes to clients.
 

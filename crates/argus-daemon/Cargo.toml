@@ -10,7 +10,9 @@ authors.workspace = true
 [dependencies]
 argus-core = { path = "../argus-core" }
 anyhow.workspace = true
+portable-pty.workspace = true
 tracing.workspace = true
+wezterm-term.workspace = true
 
 [lints]
 workspace = true

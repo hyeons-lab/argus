@@ -2,8 +2,9 @@ use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, ensure};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
@@ -120,15 +121,14 @@ pub struct PtySession {
     _master: Box<dyn MasterPty + Send>,
     child: Box<dyn Child + Send + Sync>,
     reader: Box<dyn Read + Send>,
-    log: File,
-    bytes_logged: u64,
-    terminal: Terminal,
+    _writer: Box<dyn Write + Send>,
+    output: OutputState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompletedSession {
-    pub bytes_logged: u64,
     pub output_seq: u64,
+    pub bytes_logged: u64,
     pub visible_rows: Vec<String>,
 }
 
@@ -142,60 +142,21 @@ pub struct SessionSnapshot {
 }
 
 pub struct SessionActor {
-    tx: Sender<ActorMessage>,
+    tx: Sender<ActorCommand>,
     worker: Option<JoinHandle<()>>,
     reader: Option<JoinHandle<()>>,
 }
 
 impl PtySession {
     pub fn spawn(config: SessionConfig) -> Result<Self> {
-        config.validate()?;
-
-        let pty_system = native_pty_system();
-        let pair = pty_system
-            .openpty(config.size.pty_size())
-            .context("opening PTY")?;
-
-        let mut command = CommandBuilder::new(&config.command);
-        for arg in &config.args {
-            command.arg(arg);
-        }
-        if let Some(cwd) = &config.cwd {
-            command.cwd(cwd);
-        }
-
-        let child = pair
-            .slave
-            .spawn_command(command)
-            .context("spawning PTY child")?;
-        drop(pair.slave);
-
-        let reader = pair
-            .master
-            .try_clone_reader()
-            .context("cloning PTY reader")?;
-        let log = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&config.log_path)
-            .with_context(|| format!("opening session log {}", config.log_path.display()))?;
-
-        let terminal = Terminal::new(
-            config.size.terminal_size(),
-            Arc::new(ArgusTerminalConfig),
-            "Argus",
-            env!("CARGO_PKG_VERSION"),
-            Box::new(TerminalInputSink),
-        );
+        let runtime = spawn_pty_runtime(config)?;
 
         Ok(Self {
-            _master: pair.master,
-            child,
-            reader,
-            log,
-            bytes_logged: 0,
-            terminal,
+            _master: runtime.master,
+            child: runtime.child,
+            reader: runtime.reader,
+            _writer: runtime.writer,
+            output: runtime.output,
         })
     }
 
@@ -205,7 +166,7 @@ impl PtySession {
         loop {
             match self.reader.read(&mut chunk) {
                 Ok(0) => break,
-                Ok(read_len) => self.ingest_output(&chunk[..read_len])?,
+                Ok(read_len) => self.output.ingest(&chunk[..read_len])?,
                 Err(error) if error.kind() == ErrorKind::Interrupted => continue,
                 Err(error)
                     if matches!(
@@ -223,87 +184,38 @@ impl PtySession {
         }
 
         self.child.wait().context("waiting for PTY child")?;
-        self.log.flush().context("flushing session log")?;
+        self.output.log.flush().context("flushing session log")?;
 
         Ok(CompletedSession {
-            bytes_logged: self.bytes_logged,
-            output_seq: u64::from(self.bytes_logged > 0),
-            visible_rows: visible_rows(&self.terminal),
+            output_seq: self.output.output_seq,
+            bytes_logged: self.output.bytes_logged,
+            visible_rows: visible_rows(&self.output.terminal),
         })
-    }
-
-    fn ingest_output(&mut self, bytes: &[u8]) -> Result<()> {
-        self.log
-            .write_all(bytes)
-            .context("writing PTY output log")?;
-        self.bytes_logged += bytes.len() as u64;
-        self.terminal.advance_bytes(bytes);
-        Ok(())
     }
 }
 
 impl SessionActor {
     pub fn spawn(config: SessionConfig) -> Result<Self> {
-        config.validate()?;
+        let runtime = spawn_pty_runtime(config)?;
 
-        let pty_system = native_pty_system();
-        let pair = pty_system
-            .openpty(config.size.pty_size())
-            .context("opening PTY")?;
-
-        let mut command = CommandBuilder::new(&config.command);
-        for arg in &config.args {
-            command.arg(arg);
-        }
-        if let Some(cwd) = &config.cwd {
-            command.cwd(cwd);
-        }
-
-        let child = pair
-            .slave
-            .spawn_command(command)
-            .context("spawning PTY child")?;
-        drop(pair.slave);
-
-        let reader = pair
-            .master
-            .try_clone_reader()
-            .context("cloning PTY reader")?;
-        let writer = pair.master.take_writer().context("taking PTY writer")?;
-        let log = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&config.log_path)
-            .with_context(|| format!("opening session log {}", config.log_path.display()))?;
-        let terminal = Terminal::new(
-            config.size.terminal_size(),
-            Arc::new(ArgusTerminalConfig),
-            "Argus",
-            env!("CARGO_PKG_VERSION"),
-            Box::new(TerminalInputSink),
-        );
-
-        let (tx, rx) = mpsc::channel();
-        let reader_tx = tx.clone();
-        let reader = thread::spawn(move || read_pty_output(reader, reader_tx));
+        let (command_tx, command_rx) = mpsc::channel();
+        let (output_tx, output_rx) = mpsc::sync_channel(64);
+        let reader = thread::spawn(move || read_pty_output(runtime.reader, output_tx));
         let worker = thread::spawn(move || {
             let state = ActorState {
-                master: pair.master,
-                child,
-                writer,
-                log,
-                terminal,
-                size: config.size,
-                bytes_logged: 0,
-                output_seq: 0,
+                master: runtime.master,
+                child: runtime.child,
+                writer: runtime.writer,
+                output: runtime.output,
+                size: runtime.size,
                 exited: false,
+                output_closed: false,
             };
-            run_actor(state, rx);
+            run_actor(state, command_rx, output_rx);
         });
 
         Ok(Self {
-            tx,
+            tx: command_tx,
             worker: Some(worker),
             reader: Some(reader),
         })
@@ -312,10 +224,10 @@ impl SessionActor {
     pub fn write_input(&self, bytes: impl Into<Vec<u8>>) -> Result<()> {
         let (tx, rx) = mpsc::channel();
         self.tx
-            .send(ActorMessage::Command(ActorCommand::WriteInput {
+            .send(ActorCommand::WriteInput {
                 bytes: bytes.into(),
                 response: tx,
-            }))
+            })
             .context("sending session input command")?;
         recv_actor_result(rx, "writing session input")
     }
@@ -323,10 +235,7 @@ impl SessionActor {
     pub fn resize(&self, size: SessionSize) -> Result<SessionSnapshot> {
         let (tx, rx) = mpsc::channel();
         self.tx
-            .send(ActorMessage::Command(ActorCommand::Resize {
-                size,
-                response: tx,
-            }))
+            .send(ActorCommand::Resize { size, response: tx })
             .context("sending session resize command")?;
         recv_actor_result(rx, "resizing session")
     }
@@ -334,9 +243,7 @@ impl SessionActor {
     pub fn snapshot(&self) -> Result<SessionSnapshot> {
         let (tx, rx) = mpsc::channel();
         self.tx
-            .send(ActorMessage::Command(ActorCommand::Snapshot {
-                response: tx,
-            }))
+            .send(ActorCommand::Snapshot { response: tx })
             .context("sending session snapshot command")?;
         recv_actor_result(rx, "reading session snapshot")
     }
@@ -344,9 +251,7 @@ impl SessionActor {
     pub fn shutdown(mut self) -> Result<CompletedSession> {
         let (tx, rx) = mpsc::channel();
         self.tx
-            .send(ActorMessage::Command(ActorCommand::Shutdown {
-                response: tx,
-            }))
+            .send(ActorCommand::Shutdown { response: tx })
             .context("sending session shutdown command")?;
         let completed = recv_actor_result(rx, "shutting down session")?;
         self.join_threads();
@@ -355,10 +260,10 @@ impl SessionActor {
 
     fn join_threads(&mut self) {
         if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
+            join_thread_with_timeout(worker, "session actor worker");
         }
         if let Some(reader) = self.reader.take() {
-            let _ = reader.join();
+            join_thread_with_timeout(reader, "session actor reader");
         }
     }
 }
@@ -370,11 +275,14 @@ impl Drop for SessionActor {
         }
 
         let (tx, rx) = mpsc::channel();
-        let _ = self.tx.send(ActorMessage::Command(ActorCommand::Shutdown {
-            response: tx,
-        }));
-        let _ = rx.recv();
-        self.join_threads();
+        if self
+            .tx
+            .send(ActorCommand::Shutdown { response: tx })
+            .is_err()
+        {
+            tracing::warn!("session actor stopped before drop shutdown signal");
+        }
+        drop(rx);
     }
 }
 
@@ -382,18 +290,31 @@ struct ActorState {
     master: Box<dyn MasterPty + Send>,
     child: Box<dyn Child + Send + Sync>,
     writer: Box<dyn Write + Send>,
+    output: OutputState,
+    size: SessionSize,
+    exited: bool,
+    output_closed: bool,
+}
+
+struct PtyRuntime {
+    master: Box<dyn MasterPty + Send>,
+    child: Box<dyn Child + Send + Sync>,
+    reader: Box<dyn Read + Send>,
+    writer: Box<dyn Write + Send>,
+    output: OutputState,
+    size: SessionSize,
+}
+
+struct OutputState {
     log: File,
     terminal: Terminal,
-    size: SessionSize,
     bytes_logged: u64,
     output_seq: u64,
-    exited: bool,
 }
 
 enum ActorMessage {
     Output(Vec<u8>),
-    OutputClosed(Result<(), String>),
-    Command(ActorCommand),
+    OutputClosed(Result<()>),
 }
 
 enum ActorCommand {
@@ -413,52 +334,79 @@ enum ActorCommand {
     },
 }
 
-type ActorResult<T> = std::result::Result<T, String>;
+type ActorResult<T> = Result<T>;
 
-fn run_actor(mut state: ActorState, rx: Receiver<ActorMessage>) {
-    while let Ok(message) = rx.recv() {
-        match message {
-            ActorMessage::Output(bytes) => {
-                if let Err(error) = state.ingest_output(&bytes) {
-                    tracing::warn!(error = ?error, "failed to ingest PTY output");
+fn run_actor(
+    mut state: ActorState,
+    command_rx: Receiver<ActorCommand>,
+    output_rx: Receiver<ActorMessage>,
+) {
+    loop {
+        if state.output_closed {
+            match command_rx.recv() {
+                Ok(command) => {
+                    if state.handle_command(command, &command_rx, &output_rx) {
+                        break;
+                    }
                 }
+                Err(_) => break,
             }
-            ActorMessage::OutputClosed(result) => {
-                if let Err(error) = result {
-                    tracing::warn!(error, "PTY output reader closed with error");
-                }
-                state.mark_exited();
-            }
-            ActorMessage::Command(command) => {
-                if state.handle_command(command) {
+            continue;
+        }
+
+        match command_rx.try_recv() {
+            Ok(command) => {
+                if state.handle_command(command, &command_rx, &output_rx) {
                     break;
                 }
+                continue;
+            }
+            Err(TryRecvError::Disconnected) => break,
+            Err(TryRecvError::Empty) => {}
+        }
+
+        match output_rx.recv_timeout(Duration::from_millis(20)) {
+            Ok(message) => state.handle_output(message),
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => {
+                state.output_closed = true;
+                state.mark_exited();
             }
         }
     }
 }
 
 impl ActorState {
-    fn ingest_output(&mut self, bytes: &[u8]) -> Result<()> {
-        self.log
-            .write_all(bytes)
-            .context("writing PTY output log")?;
-        self.bytes_logged += bytes.len() as u64;
-        self.output_seq += 1;
-        self.terminal.advance_bytes(bytes);
-        Ok(())
+    fn handle_output(&mut self, message: ActorMessage) {
+        match message {
+            ActorMessage::Output(bytes) => {
+                if let Err(error) = self.output.ingest(&bytes) {
+                    tracing::warn!(error = ?error, "failed to ingest PTY output");
+                }
+            }
+            ActorMessage::OutputClosed(result) => {
+                if let Err(error) = result {
+                    tracing::warn!(error = ?error, "PTY output reader closed with error");
+                }
+                self.output_closed = true;
+                self.mark_exited();
+            }
+        }
     }
 
-    fn handle_command(&mut self, command: ActorCommand) -> bool {
+    fn handle_command(
+        &mut self,
+        command: ActorCommand,
+        command_rx: &Receiver<ActorCommand>,
+        output_rx: &Receiver<ActorMessage>,
+    ) -> bool {
         match command {
             ActorCommand::WriteInput { bytes, response } => {
-                let result = self.write_input(&bytes).map_err(|error| error.to_string());
-                let _ = response.send(result);
+                let _ = response.send(self.write_input(&bytes));
                 false
             }
             ActorCommand::Resize { size, response } => {
-                let result = self.resize(size).map_err(|error| error.to_string());
-                let _ = response.send(result);
+                let _ = response.send(self.resize(size));
                 false
             }
             ActorCommand::Snapshot { response } => {
@@ -466,8 +414,7 @@ impl ActorState {
                 false
             }
             ActorCommand::Shutdown { response } => {
-                let result = self.shutdown().map_err(|error| error.to_string());
-                let _ = response.send(result);
+                let _ = response.send(self.shutdown(command_rx, output_rx));
                 true
             }
         }
@@ -487,32 +434,41 @@ impl ActorState {
         self.master
             .resize(size.pty_size())
             .context("resizing PTY")?;
-        self.terminal.resize(size.terminal_size());
+        self.output.terminal.resize(size.terminal_size());
         self.size = size;
         Ok(self.snapshot())
     }
 
     fn snapshot(&self) -> SessionSnapshot {
         SessionSnapshot {
-            output_seq: self.output_seq,
-            bytes_logged: self.bytes_logged,
+            output_seq: self.output.output_seq,
+            bytes_logged: self.output.bytes_logged,
             size: self.size.clone(),
-            visible_rows: visible_rows(&self.terminal),
+            visible_rows: visible_rows(&self.output.terminal),
             exited: self.exited,
         }
     }
 
-    fn shutdown(&mut self) -> Result<CompletedSession> {
+    fn shutdown(
+        &mut self,
+        command_rx: &Receiver<ActorCommand>,
+        output_rx: &Receiver<ActorMessage>,
+    ) -> Result<CompletedSession> {
         if !self.exited {
-            self.child.kill().context("terminating PTY child")?;
-            self.mark_exited();
+            self.reap_child();
+            if !self.exited {
+                self.child.kill().context("terminating PTY child")?;
+                self.exited = true;
+            }
         }
-        self.log.flush().context("flushing session log")?;
+        self.drain_shutdown_output(command_rx, output_rx);
+        self.reap_child();
+        self.output.log.flush().context("flushing session log")?;
 
         Ok(CompletedSession {
-            bytes_logged: self.bytes_logged,
-            output_seq: self.output_seq,
-            visible_rows: visible_rows(&self.terminal),
+            output_seq: self.output.output_seq,
+            bytes_logged: self.output.bytes_logged,
+            visible_rows: visible_rows(&self.output.terminal),
         })
     }
 
@@ -521,20 +477,132 @@ impl ActorState {
             return;
         }
 
+        self.reap_child();
+    }
+
+    fn reap_child(&mut self) {
         match self.child.try_wait() {
-            Ok(Some(_)) => {}
-            Ok(None) => {
-                if let Err(error) = self.child.wait() {
-                    tracing::warn!(error = ?error, "failed waiting for PTY child");
-                }
-            }
+            Ok(Some(_)) => self.exited = true,
+            Ok(None) => {}
             Err(error) => tracing::warn!(error = ?error, "failed polling PTY child"),
         }
-        self.exited = true;
+    }
+
+    fn drain_shutdown_output(
+        &mut self,
+        command_rx: &Receiver<ActorCommand>,
+        output_rx: &Receiver<ActorMessage>,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+
+        loop {
+            while let Ok(command) = command_rx.try_recv() {
+                reject_command_during_shutdown(command);
+            }
+
+            if self.output_closed {
+                break;
+            }
+
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                tracing::warn!("timed out draining PTY output during shutdown");
+                break;
+            }
+
+            match output_rx.recv_timeout(remaining) {
+                Ok(ActorMessage::Output(bytes)) => {
+                    if let Err(error) = self.output.ingest(&bytes) {
+                        tracing::warn!(error = ?error, "failed to ingest PTY output during shutdown");
+                    }
+                }
+                Ok(ActorMessage::OutputClosed(result)) => {
+                    if let Err(error) = result {
+                        tracing::warn!(error = ?error, "PTY output reader closed with error");
+                    }
+                    self.output_closed = true;
+                    self.exited = true;
+                    break;
+                }
+                Err(RecvTimeoutError::Timeout) => break,
+                Err(RecvTimeoutError::Disconnected) => {
+                    self.output_closed = true;
+                    break;
+                }
+            }
+        }
     }
 }
 
-fn read_pty_output(mut reader: Box<dyn Read + Send>, tx: Sender<ActorMessage>) {
+impl OutputState {
+    fn ingest(&mut self, bytes: &[u8]) -> Result<()> {
+        self.log
+            .write_all(bytes)
+            .context("writing PTY output log")?;
+        self.bytes_logged += bytes.len() as u64;
+        self.output_seq += 1;
+        self.terminal.advance_bytes(bytes);
+        Ok(())
+    }
+}
+
+fn spawn_pty_runtime(config: SessionConfig) -> Result<PtyRuntime> {
+    config.validate()?;
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(config.size.pty_size())
+        .context("opening PTY")?;
+
+    let mut command = CommandBuilder::new(&config.command);
+    for arg in &config.args {
+        command.arg(arg);
+    }
+    if let Some(cwd) = &config.cwd {
+        command.cwd(cwd);
+    }
+
+    let child = pair
+        .slave
+        .spawn_command(command)
+        .context("spawning PTY child")?;
+    drop(pair.slave);
+
+    let reader = pair
+        .master
+        .try_clone_reader()
+        .context("cloning PTY reader")?;
+    let writer = pair.master.take_writer().context("taking PTY writer")?;
+    let log = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&config.log_path)
+        .with_context(|| format!("opening session log {}", config.log_path.display()))?;
+    let terminal = Terminal::new(
+        config.size.terminal_size(),
+        Arc::new(ArgusTerminalConfig),
+        "Argus",
+        env!("CARGO_PKG_VERSION"),
+        Box::new(TerminalInputSink),
+    );
+
+    Ok(PtyRuntime {
+        master: pair.master,
+        child,
+        reader,
+        writer,
+        output: OutputState {
+            log,
+            terminal,
+            bytes_logged: 0,
+            output_seq: 0,
+        },
+        size: config.size,
+    })
+}
+
+fn read_pty_output(mut reader: Box<dyn Read + Send>, tx: SyncSender<ActorMessage>) {
     let mut chunk = [0; 8192];
 
     loop {
@@ -562,7 +630,9 @@ fn read_pty_output(mut reader: Box<dyn Read + Send>, tx: Sender<ActorMessage>) {
                 break;
             }
             Err(error) => {
-                let _ = tx.send(ActorMessage::OutputClosed(Err(error.to_string())));
+                let _ = tx.send(ActorMessage::OutputClosed(
+                    Err(error).context("reading PTY output"),
+                ));
                 break;
             }
         }
@@ -572,7 +642,39 @@ fn read_pty_output(mut reader: Box<dyn Read + Send>, tx: Sender<ActorMessage>) {
 fn recv_actor_result<T>(rx: Receiver<ActorResult<T>>, context: &'static str) -> Result<T> {
     rx.recv()
         .with_context(|| format!("{context}: actor stopped"))?
-        .map_err(|error| anyhow!("{context}: {error}"))
+        .with_context(|| context)
+}
+
+fn reject_command_during_shutdown(command: ActorCommand) {
+    let error = anyhow!("session is shutting down");
+    match command {
+        ActorCommand::WriteInput { response, .. } => {
+            let _ = response.send(Err(error));
+        }
+        ActorCommand::Resize { response, .. } => {
+            let _ = response.send(Err(error));
+        }
+        ActorCommand::Snapshot { response } => {
+            let _ = response.send(Err(error));
+        }
+        ActorCommand::Shutdown { response } => {
+            let _ = response.send(Err(error));
+        }
+    }
+}
+
+fn join_thread_with_timeout(handle: JoinHandle<()>, name: &'static str) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+
+    while !handle.is_finished() {
+        if Instant::now() >= deadline {
+            tracing::warn!(thread = name, "timed out joining thread");
+            return;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    let _ = handle.join();
 }
 
 struct TerminalInputSink;
@@ -721,6 +823,49 @@ mod tests {
         );
     }
 
+    #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "portable-pty ConPTY EOF handling needs a dedicated Windows lifecycle test"
+    )]
+    fn session_actor_keeps_final_state_after_output_closes() {
+        let log_path = unique_log_path();
+        let mut config = command_that_prints_marker(log_path.clone());
+        config.size = SessionSize {
+            rows: 6,
+            cols: 32,
+            pixel_width: 640,
+            pixel_height: 240,
+            dpi: 96,
+        };
+
+        let actor = SessionActor::spawn(config).expect("spawn session actor");
+        let snapshot = wait_for_exited_snapshot(&actor);
+        assert!(
+            snapshot
+                .visible_rows
+                .iter()
+                .any(|row| row.contains("argus-ready")),
+            "snapshot visible rows did not contain marker: {:?}",
+            snapshot.visible_rows
+        );
+
+        let completed = actor.shutdown().expect("shutdown exited session actor");
+        let logged = std::fs::read(&log_path).expect("read raw PTY log");
+        let _ = std::fs::remove_file(&log_path);
+
+        assert_eq!(completed.bytes_logged, logged.len() as u64);
+        assert_eq!(completed.output_seq, snapshot.output_seq);
+        assert!(
+            completed
+                .visible_rows
+                .iter()
+                .any(|row| row.contains("argus-ready")),
+            "completed visible rows did not contain marker: {:?}",
+            completed.visible_rows
+        );
+    }
+
     fn unique_log_path() -> PathBuf {
         let unique = format!(
             "argus-pty-session-{}-{:?}.log",
@@ -776,6 +921,24 @@ mod tests {
             assert!(
                 Instant::now() < deadline,
                 "timed out waiting for {marker}; latest snapshot: {:?}",
+                snapshot
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn wait_for_exited_snapshot(actor: &SessionActor) -> SessionSnapshot {
+        let deadline = Instant::now() + Duration::from_secs(5);
+
+        loop {
+            let snapshot = actor.snapshot().expect("snapshot session actor");
+            if snapshot.exited {
+                return snapshot;
+            }
+
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for session exit; latest snapshot: {:?}",
                 snapshot
             );
             std::thread::sleep(Duration::from_millis(20));

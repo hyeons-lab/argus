@@ -19,6 +19,7 @@ Prove the least complex packaging path for using upstream `wezterm-term` directl
 - 2026-05-12T17:39-0700 — Created `spike/wezterm-term-packaging` worktree from `origin/main`.
 - 2026-05-12T17:39-0700 — Tested `git` plus `path = "term"` in the dependency declaration; Cargo rejected it as ambiguous because only one of `git` or `path` is allowed.
 - 2026-05-12T17:39-0700 — Normalized the upstream Git dependency URL to `https://github.com/wezterm/wezterm.git` and confirmed Cargo still resolves the `wezterm-term` package from the upstream workspace.
+- 2026-05-12T18:06-0700 — Addressed PR review feedback by rewording the plan to say direct Git dependency and explicit package name instead of direct path dependency.
 
 ## What Changed
 
@@ -34,7 +35,8 @@ Prove the least complex packaging path for using upstream `wezterm-term` directl
 
 ## Commits
 
-- HEAD — test: normalize wezterm-term git dependency
+- 605b2ea — test: normalize wezterm-term git dependency
+- HEAD — docs: clarify wezterm-term dependency wording
 
 ## Next Steps
 

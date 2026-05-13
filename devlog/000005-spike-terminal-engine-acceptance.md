@@ -24,12 +24,14 @@ Start Phase 1 by comparing terminal engine candidates and deciding the daemon-ow
 - 2026-05-12T09:14-0700 — Added compile spikes for upstream Git-pinned `wezterm-term` and crates.io `alacritty_terminal`; both candidates accept chunked PTY byte ingestion in tests.
 - 2026-05-12T09:32-0700 — Gated heavyweight engine compile spikes behind the explicit `engine-spikes` feature so default support tests stay lightweight.
 - 2026-05-12T10:59-0700 — Addressed PR feedback by pinning `wezterm-term` to the reviewed upstream commit and clarifying the observed dependency cost in the matrix.
+- 2026-05-12T11:42-0700 — Extended both engine spikes to render visible-cell snapshots for every engine-neutral acceptance scenario.
 
 ## What Changed
 
 - Added reusable, engine-neutral terminal acceptance scenarios to `argus-test-support`.
 - Added snapshots for resize, late attach, reconnect, alt-screen, bracketed paste, mouse reporting, scroll regions, replay, and log tee parser behavior.
 - Added feature-gated compile spikes for upstream Git-pinned `wezterm-term` and crates.io `alacritty_terminal`.
+- Added candidate visible-cell snapshots for the full acceptance scenario list and replay equivalence checks at the engine layer.
 - Added `devlog/terminal-engine-compatibility-matrix.md` with candidate packaging, acceptance matrix, recommended daemon VT state model, and fork artifact option.
 
 ## Research & Discoveries
@@ -45,16 +47,16 @@ Start Phase 1 by comparing terminal engine candidates and deciding the daemon-ow
 
 - `cargo fmt --all --check`
 - `cargo test -p argus-test-support`
-- `cargo test -p argus-test-support --features engine-spikes`
 - `cargo check -p argus-test-support --features engine-spikes`
+- `cargo test -p argus-test-support --features engine-spikes` (re-run after adding visible-cell snapshots)
 
 ## Commits
 
 - 6ba7ebf — test: add terminal engine acceptance spikes
-- HEAD — docs: address terminal engine review feedback
+- 7957707 — docs: address terminal engine review feedback
+- HEAD — test: add terminal engine visible snapshots
 
 ## Next Steps
 
-- Extend the engine-specific spikes to produce visible-cell snapshots for every engine-neutral acceptance scenario.
 - Decide whether direct Git-pinned upstream `wezterm-term` belongs in default CI or should be replaced by a vendored/forked/published package artifact path before Phase 2.
 - Decide whether Phase 2 needs serialized engine snapshots or checkpoint-plus-tail rebuilds.

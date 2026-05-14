@@ -114,6 +114,8 @@ dependencies = [
  "anyhow",
  "argus-core",
  "portable-pty",
+ "serde",
+ "serde_json",
  "tracing",
  "wezterm-term",
 ]
@@ -141,6 +143,7 @@ dependencies = [
  "argus-daemon",
  "crossterm",
  "ratatui",
+ "tracing",
 ]
 
 [[package]]

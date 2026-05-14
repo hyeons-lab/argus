@@ -18,7 +18,7 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 fn main() -> Result<()> {
     let size = initial_session_size()?;
-    let mut app = LocalSessionApp::start(size).context("starting local session")?;
+    let mut app = start_app(size).context("starting local session")?;
     let mut terminal = match TerminalSession::enter().context("starting terminal UI") {
         Ok(terminal) => terminal,
         Err(error) => {
@@ -34,6 +34,24 @@ fn main() -> Result<()> {
     result?;
     shutdown_result.context("shutting down local session")?;
     Ok(())
+}
+
+#[cfg(unix)]
+fn start_app(size: SessionSize) -> Result<LocalSessionApp> {
+    let socket_path = argus_daemon::ipc::default_socket_path();
+    LocalSessionApp::connect(&socket_path, size.clone()).or_else(|socket_error| {
+        tracing::warn!(
+            socket_path = %socket_path.display(),
+            error = ?socket_error,
+            "falling back to embedded local session manager"
+        );
+        LocalSessionApp::start(size)
+    })
+}
+
+#[cfg(not(unix))]
+fn start_app(size: SessionSize) -> Result<LocalSessionApp> {
+    LocalSessionApp::start(size)
 }
 
 fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut LocalSessionApp) -> Result<()> {

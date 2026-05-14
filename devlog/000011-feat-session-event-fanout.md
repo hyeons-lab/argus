@@ -13,6 +13,7 @@ Add daemon session event fan-out so attached clients can observe live output, le
 - Keep the first subscription surface in-process with `std::sync::mpsc` receivers; Unix socket, WebSocket, TUI, and MCP adapters can translate the same event stream later.
 - Emit output and lifecycle events from `SessionActor`, where ordered PTY bytes and terminal snapshots are already serialized.
 - Emit lease-change events from `SessionManager`, where input ownership state is maintained.
+- Pin Junie to the documented stable CLI version instead of `latest`; the nightly runner installed by `latest` authenticated but failed before producing its JSON result file.
 
 ## What Changed
 
@@ -27,11 +28,13 @@ Add daemon session event fan-out so attached clients can observe live output, le
 - `cargo check --workspace`
 - `cargo test --workspace`
 - `cargo clippy --all-targets --all-features -- -D warnings`
+- `git diff --check`
 
 ## Progress
 
 - 2026-05-13T21:21-0700 — Created `feat/session-event-fanout` worktree from `origin/main` and unset the accidental upstream.
 - 2026-05-13T21:38-0700 — Added in-process session event fan-out and validated the workspace.
+- 2026-05-13T21:52-0700 — Investigated Junie run `25842326501`; pinned Junie away from nightly after `latest` installed CLI `1699.1` and failed with `Failed to build 'issue.md.junie_standalone'`.
 
 ## Next Steps
 
@@ -40,4 +43,5 @@ Add daemon session event fan-out so attached clients can observe live output, le
 
 ## Commits
 
-- HEAD — feat: add session event fanout
+- f4083c9 — feat: add session event fanout
+- HEAD — ci: pin Junie runner version

@@ -17,8 +17,10 @@ all = "warn"
 
 [workspace.dependencies]
 anyhow = "1"
+crossterm = "0.28"
 insta = "1"
 portable-pty = "0.9"
+ratatui = "0.29"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 tracing = "0.1"

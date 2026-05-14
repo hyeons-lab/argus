@@ -6,7 +6,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError};
+use std::sync::mpsc::{
+    self, Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError, TrySendError,
+};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -20,6 +22,8 @@ use argus_core::session::{
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use wezterm_term::color::ColorPalette;
 use wezterm_term::{Terminal, TerminalConfiguration, TerminalSize};
+
+const EVENT_SUBSCRIBER_BUFFER: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionConfig {
@@ -472,7 +476,7 @@ struct ActorState {
     output_closed: bool,
     exit_broadcasted: bool,
     event_session_id: Option<SessionId>,
-    subscribers: Vec<Sender<SessionEvent>>,
+    subscribers: Vec<SyncSender<SessionEvent>>,
 }
 
 struct PtyRuntime {
@@ -529,13 +533,17 @@ fn run_actor(
 ) {
     loop {
         if state.output_closed {
-            match command_rx.recv() {
+            match command_rx.recv_timeout(Duration::from_millis(20)) {
                 Ok(command) => {
                     if state.handle_command(command, &command_rx, &output_rx) {
                         break;
                     }
                 }
-                Err(_) => break,
+                Err(RecvTimeoutError::Timeout) => {
+                    state.reap_child();
+                    state.broadcast_exit();
+                }
+                Err(RecvTimeoutError::Disconnected) => break,
             }
             continue;
         }
@@ -686,14 +694,17 @@ impl ActorState {
             self.event_session_id.is_some(),
             "session actor was not configured for event fan-out"
         );
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(EVENT_SUBSCRIBER_BUFFER);
         self.subscribers.push(tx);
         Ok(rx)
     }
 
     fn broadcast(&mut self, event: SessionEvent) {
         self.subscribers
-            .retain(|subscriber| subscriber.send(event.clone()).is_ok());
+            .retain(|subscriber| match subscriber.try_send(event.clone()) {
+                Ok(()) => true,
+                Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => false,
+            });
     }
 
     fn broadcast_exit(&mut self) {
@@ -1341,30 +1352,16 @@ mod tests {
                 },
             })
             .expect("resize managed session");
-        assert!(matches!(
-            wait_for_event(&first_subscriber, "resize snapshot event", |event| {
-                matches!(
-                    event,
-                    SessionEvent::Snapshot { session_id: event_session_id, snapshot }
-                        if event_session_id == &session_id && snapshot.size.rows == 8
-                )
-            }),
-            SessionEvent::Snapshot { .. }
-        ));
+        wait_for_snapshot_event(&first_subscriber, &session_id, 8);
+        wait_for_snapshot_event(&second_subscriber, &session_id, 8);
 
         manager
             .shutdown_session(session_id.clone())
             .expect("shutdown managed session");
-        assert!(matches!(
-            wait_for_event(&first_subscriber, "exit event", |event| {
-                matches!(
-                    event,
-                    SessionEvent::Exited { session_id: event_session_id, completed }
-                        if event_session_id == &session_id && completed.output_seq > 0
-                )
-            }),
-            SessionEvent::Exited { .. }
-        ));
+        wait_for_exit_event(&first_subscriber, &session_id);
+        wait_for_exit_event(&second_subscriber, &session_id);
+        assert_no_exit_event(&first_subscriber, &session_id);
+        assert_no_exit_event(&second_subscriber, &session_id);
         let _ = std::fs::remove_dir_all(&log_dir);
     }
 
@@ -1494,15 +1491,91 @@ mod tests {
         receiver: &SessionEventReceiver,
         session_id: &SessionId,
         marker: &str,
-    ) -> SessionEvent {
-        wait_for_event(receiver, "output event", |event| {
-            matches!(
-                event,
-                SessionEvent::Output { session_id: event_session_id, bytes, .. }
-                    if event_session_id == session_id
-                        && String::from_utf8_lossy(bytes).contains(marker)
-            )
-        })
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut output = Vec::new();
+
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "timed out waiting for output marker {marker}; latest output: {:?}",
+                String::from_utf8_lossy(&output)
+            );
+            let event = receiver
+                .recv_timeout(remaining.min(Duration::from_millis(100)))
+                .unwrap_or_else(|error| {
+                    panic!("event stream ended while waiting for output marker {marker}: {error}")
+                });
+            if let SessionEvent::Output {
+                session_id: event_session_id,
+                bytes,
+                ..
+            } = event
+                && &event_session_id == session_id
+            {
+                output.extend_from_slice(&bytes);
+                if output.len() > 8192 {
+                    output.drain(..output.len() - 8192);
+                }
+                if String::from_utf8_lossy(&output).contains(marker) {
+                    return;
+                }
+            }
+        }
+    }
+
+    fn wait_for_snapshot_event(
+        receiver: &SessionEventReceiver,
+        session_id: &SessionId,
+        rows: usize,
+    ) {
+        assert!(matches!(
+            wait_for_event(receiver, "resize snapshot event", |event| {
+                matches!(
+                    event,
+                    SessionEvent::Snapshot { session_id: event_session_id, snapshot }
+                        if event_session_id == session_id && snapshot.size.rows == rows
+                )
+            }),
+            SessionEvent::Snapshot { .. }
+        ));
+    }
+
+    fn wait_for_exit_event(receiver: &SessionEventReceiver, session_id: &SessionId) {
+        assert!(matches!(
+            wait_for_event(receiver, "exit event", |event| {
+                matches!(
+                    event,
+                    SessionEvent::Exited { session_id: event_session_id, completed }
+                        if event_session_id == session_id && completed.output_seq > 0
+                )
+            }),
+            SessionEvent::Exited { .. }
+        ));
+    }
+
+    fn assert_no_exit_event(receiver: &SessionEventReceiver, session_id: &SessionId) {
+        let deadline = Instant::now() + Duration::from_millis(100);
+
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return;
+            }
+
+            match receiver.recv_timeout(remaining.min(Duration::from_millis(20))) {
+                Ok(SessionEvent::Exited {
+                    session_id: event_session_id,
+                    ..
+                }) if &event_session_id == session_id => {
+                    panic!("received duplicate exit event for session {session_id}");
+                }
+                Ok(_) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+            }
+        }
     }
 
     fn wait_for_event(

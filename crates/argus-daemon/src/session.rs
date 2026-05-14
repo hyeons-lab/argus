@@ -197,22 +197,36 @@ impl PtySession {
 impl SessionActor {
     pub fn spawn(config: SessionConfig) -> Result<Self> {
         let runtime = spawn_pty_runtime(config)?;
+        let PtyRuntime {
+            master,
+            child,
+            reader,
+            writer,
+            output,
+            size,
+        } = runtime;
 
         let (command_tx, command_rx) = mpsc::channel();
         let (output_tx, output_rx) = mpsc::sync_channel(64);
-        let reader = thread::spawn(move || read_pty_output(runtime.reader, output_tx));
-        let worker = thread::spawn(move || {
-            let state = ActorState {
-                master: runtime.master,
-                child: runtime.child,
-                writer: runtime.writer,
-                output: runtime.output,
-                size: runtime.size,
-                exited: false,
-                output_closed: false,
-            };
-            run_actor(state, command_rx, output_rx);
-        });
+        let reader = thread::Builder::new()
+            .name("session-actor-reader".into())
+            .spawn(move || read_pty_output(reader, output_tx))
+            .context("spawning session actor reader thread")?;
+        let worker = thread::Builder::new()
+            .name("session-actor-worker".into())
+            .spawn(move || {
+                let state = ActorState {
+                    master,
+                    child,
+                    writer,
+                    output,
+                    size,
+                    exited: false,
+                    output_closed: false,
+                };
+                run_actor(state, command_rx, output_rx);
+            })
+            .context("spawning session actor worker thread")?;
 
         Ok(Self {
             tx: command_tx,
@@ -675,7 +689,9 @@ fn join_thread_with_timeout(handle: JoinHandle<()>, name: &'static str) {
         thread::sleep(Duration::from_millis(10));
     }
 
-    let _ = handle.join();
+    if handle.join().is_err() {
+        tracing::error!(thread = name, "thread panicked during shutdown");
+    }
 }
 
 struct TerminalInputSink;

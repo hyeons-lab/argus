@@ -7,5 +7,12 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[dependencies]
+argus-core = { path = "../argus-core" }
+argus-daemon = { path = "../argus-daemon" }
+anyhow.workspace = true
+crossterm.workspace = true
+ratatui.workspace = true
+
 [lints]
 workspace = true

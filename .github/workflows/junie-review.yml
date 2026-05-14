@@ -34,6 +34,6 @@ jobs:
         uses: JetBrains/junie-github-action@fe548a7e4054c23c5314631757f7cd5abab8a0cf
         with:
           junie_api_key: ${{ secrets.JUNIE_API_KEY }}
-          junie_version: latest
+          junie_version: 1543.24
           prompt: code-review
           use_single_comment: true

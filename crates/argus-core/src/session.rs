@@ -1,5 +1,6 @@
 use std::fmt;
 use std::path::PathBuf;
+use std::sync::mpsc::Receiver;
 
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -294,9 +295,12 @@ pub enum SessionEvent {
     },
 }
 
+pub type SessionEventReceiver = Receiver<SessionEvent>;
+
 pub trait SessionApi {
     fn start_session(&self, request: StartSessionRequest) -> Result<SessionId>;
     fn attach_session(&self, request: AttachSessionRequest) -> Result<AttachSessionResponse>;
+    fn subscribe_session_events(&self, session_id: SessionId) -> Result<SessionEventReceiver>;
     fn acquire_input_lease(&self, request: InputLeaseRequest) -> Result<LeaseChange>;
     fn release_input_lease(
         &self,

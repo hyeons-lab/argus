@@ -1,13 +1,21 @@
+use std::collections::HashMap;
+use std::fs;
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, ensure};
-use argus_core::session::{CompletedSession, SessionSize, SessionSnapshot};
+use argus_core::session::{
+    AttachSessionRequest, AttachSessionResponse, ClientId, CompletedSession, InputLeaseRequest,
+    InputLeaseState, LeaseChange, ResizeSessionRequest, SessionApi, SessionId, SessionSize,
+    SessionSnapshot, StartSessionRequest, WriteInputRequest,
+};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use wezterm_term::color::ColorPalette;
 use wezterm_term::{Terminal, TerminalConfiguration, TerminalSize};
@@ -64,6 +72,174 @@ pub struct SessionActor {
     reader: Option<JoinHandle<()>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionManagerConfig {
+    pub log_dir: PathBuf,
+}
+
+impl SessionManagerConfig {
+    pub fn new(log_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            log_dir: log_dir.into(),
+        }
+    }
+}
+
+pub struct SessionManager {
+    config: SessionManagerConfig,
+    next_session: AtomicU64,
+    sessions: Mutex<HashMap<SessionId, ManagedSession>>,
+}
+
+struct ManagedSession {
+    actor: SessionActor,
+    lease: InputLeaseState,
+}
+
+impl SessionManager {
+    pub fn new(config: SessionManagerConfig) -> Self {
+        Self {
+            config,
+            next_session: AtomicU64::new(1),
+            sessions: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn allocate_session_id(&self) -> Result<SessionId> {
+        let sequence = self.next_session.fetch_add(1, Ordering::Relaxed);
+        SessionId::new(format!("session-{sequence}"))
+    }
+
+    fn log_path(&self, session_id: &SessionId) -> PathBuf {
+        self.config.log_dir.join(format!("{session_id}.log"))
+    }
+
+    fn sessions(&self) -> Result<std::sync::MutexGuard<'_, HashMap<SessionId, ManagedSession>>> {
+        self.sessions
+            .lock()
+            .map_err(|_| anyhow!("session manager lock poisoned"))
+    }
+}
+
+impl Default for SessionManager {
+    fn default() -> Self {
+        Self::new(SessionManagerConfig::new(default_log_dir()))
+    }
+}
+
+impl SessionApi for SessionManager {
+    fn start_session(&self, request: StartSessionRequest) -> Result<SessionId> {
+        request.validate()?;
+        fs::create_dir_all(&self.config.log_dir).with_context(|| {
+            format!("creating session log dir {}", self.config.log_dir.display())
+        })?;
+
+        let session_id = self.allocate_session_id()?;
+        let log_path = self.log_path(&session_id);
+        let config = SessionConfig {
+            command: request.command,
+            args: request.args,
+            cwd: request.cwd,
+            size: request.size,
+            log_path,
+        };
+        let actor = SessionActor::spawn(config)?;
+
+        let mut sessions = self.sessions()?;
+        sessions.insert(
+            session_id.clone(),
+            ManagedSession {
+                actor,
+                lease: InputLeaseState::default(),
+            },
+        );
+        Ok(session_id)
+    }
+
+    fn attach_session(&self, request: AttachSessionRequest) -> Result<AttachSessionResponse> {
+        let mut sessions = self.sessions()?;
+        let session = sessions
+            .get_mut(&request.session_id)
+            .with_context(|| format!("session {} not found", request.session_id))?;
+
+        if let Some(kind) = request.mode.controller_kind() {
+            session.lease.acquire(request.client_id, kind);
+        }
+
+        Ok(AttachSessionResponse {
+            snapshot: session.actor.snapshot()?,
+            lease: session.lease.clone(),
+        })
+    }
+
+    fn acquire_input_lease(&self, request: InputLeaseRequest) -> Result<LeaseChange> {
+        let mut sessions = self.sessions()?;
+        let session = sessions
+            .get_mut(&request.session_id)
+            .with_context(|| format!("session {} not found", request.session_id))?;
+        Ok(session.lease.acquire(request.client_id, request.kind))
+    }
+
+    fn release_input_lease(
+        &self,
+        session_id: SessionId,
+        client_id: ClientId,
+    ) -> Result<LeaseChange> {
+        let mut sessions = self.sessions()?;
+        let session = sessions
+            .get_mut(&session_id)
+            .with_context(|| format!("session {session_id} not found"))?;
+        session
+            .lease
+            .release(&client_id)
+            .with_context(|| format!("client {client_id} does not hold input lease"))
+    }
+
+    fn write_input(&self, request: WriteInputRequest) -> Result<()> {
+        let sessions = self.sessions()?;
+        let session = sessions
+            .get(&request.session_id)
+            .with_context(|| format!("session {} not found", request.session_id))?;
+        let holder =
+            session.lease.holder.as_ref().with_context(|| {
+                format!("session {} has no input lease holder", request.session_id)
+            })?;
+        ensure!(
+            holder.client_id == request.client_id,
+            "client {} does not hold input lease for session {}",
+            request.client_id,
+            request.session_id
+        );
+        session.actor.write_input(request.bytes)
+    }
+
+    fn resize_session(&self, request: ResizeSessionRequest) -> Result<SessionSnapshot> {
+        let sessions = self.sessions()?;
+        let session = sessions
+            .get(&request.session_id)
+            .with_context(|| format!("session {} not found", request.session_id))?;
+        session.actor.resize(request.size)
+    }
+
+    fn snapshot_session(&self, session_id: SessionId) -> Result<SessionSnapshot> {
+        let sessions = self.sessions()?;
+        let session = sessions
+            .get(&session_id)
+            .with_context(|| format!("session {session_id} not found"))?;
+        session.actor.snapshot()
+    }
+
+    fn shutdown_session(&self, session_id: SessionId) -> Result<CompletedSession> {
+        let session = {
+            let mut sessions = self.sessions()?;
+            sessions
+                .remove(&session_id)
+                .with_context(|| format!("session {session_id} not found"))?
+        };
+        session.actor.shutdown()
+    }
+}
+
 impl PtySession {
     pub fn spawn(config: SessionConfig) -> Result<Self> {
         let runtime = spawn_pty_runtime(config)?;
@@ -109,6 +285,18 @@ impl PtySession {
             visible_rows: visible_rows(&self.output.terminal),
         })
     }
+}
+
+fn default_log_dir() -> PathBuf {
+    std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            let home = std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(std::env::temp_dir);
+            home.join(".local/state")
+        })
+        .join("argus/sessions")
 }
 
 impl SessionActor {
@@ -819,6 +1007,115 @@ mod tests {
         );
     }
 
+    #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "portable-pty ConPTY EOF handling needs a dedicated Windows lifecycle test"
+    )]
+    fn session_manager_enforces_input_lease_before_writing() {
+        let log_dir = unique_log_dir();
+        let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
+        let mut request = StartSessionRequest::new(long_running_shell_command());
+        request.size = SessionSize {
+            rows: 6,
+            cols: 40,
+            pixel_width: 800,
+            pixel_height: 240,
+            dpi: 96,
+        };
+        let session_id = manager.start_session(request).expect("start session");
+        let observer = ClientId::new("observer").expect("observer id");
+        let local_tui = ClientId::new("local-tui").expect("local tui id");
+        let remote_agent = ClientId::new("remote-agent").expect("remote agent id");
+
+        let observed = manager
+            .attach_session(AttachSessionRequest {
+                session_id: session_id.clone(),
+                client_id: observer.clone(),
+                mode: argus_core::session::AttachMode::Observer,
+            })
+            .expect("attach observer");
+        assert!(observed.lease.holder.is_none());
+        assert!(
+            manager
+                .write_input(WriteInputRequest {
+                    session_id: session_id.clone(),
+                    client_id: observer,
+                    bytes: input_that_prints_marker(),
+                })
+                .is_err(),
+            "observer should not be allowed to write PTY input"
+        );
+
+        let controlled = manager
+            .attach_session(AttachSessionRequest {
+                session_id: session_id.clone(),
+                client_id: local_tui.clone(),
+                mode: argus_core::session::AttachMode::InteractiveController,
+            })
+            .expect("attach controller");
+        assert_eq!(
+            controlled.lease.holder.as_ref().unwrap().client_id,
+            local_tui
+        );
+        manager
+            .write_input(WriteInputRequest {
+                session_id: session_id.clone(),
+                client_id: local_tui.clone(),
+                bytes: input_that_prints_marker(),
+            })
+            .expect("controller writes input");
+        let first = wait_for_manager_marker(&manager, session_id.clone(), "actor-ready");
+        assert!(first.output_seq > 0);
+
+        let takeover = manager
+            .acquire_input_lease(InputLeaseRequest {
+                session_id: session_id.clone(),
+                client_id: remote_agent.clone(),
+                kind: argus_core::session::InputControllerKind::Agent,
+            })
+            .expect("agent takes lease");
+        assert_eq!(takeover.previous.unwrap().client_id, local_tui);
+        assert!(
+            manager
+                .write_input(WriteInputRequest {
+                    session_id: session_id.clone(),
+                    client_id: local_tui,
+                    bytes: input_that_prints_marker(),
+                })
+                .is_err(),
+            "previous holder should not be allowed to write after takeover"
+        );
+
+        manager
+            .release_input_lease(session_id.clone(), remote_agent.clone())
+            .expect("release agent lease");
+        assert!(
+            manager
+                .write_input(WriteInputRequest {
+                    session_id: session_id.clone(),
+                    client_id: remote_agent,
+                    bytes: input_that_prints_marker(),
+                })
+                .is_err(),
+            "released holder should not be allowed to write"
+        );
+
+        let completed = manager
+            .shutdown_session(session_id.clone())
+            .expect("shutdown managed session");
+        let logged = std::fs::read(log_dir.join(format!("{session_id}.log")))
+            .expect("read managed session log");
+        let _ = std::fs::remove_dir_all(&log_dir);
+
+        assert_eq!(completed.bytes_logged, logged.len() as u64);
+        assert!(
+            String::from_utf8_lossy(&logged).contains("actor-ready"),
+            "managed PTY log did not contain marker: {:?}",
+            logged
+        );
+    }
+
     fn unique_log_path() -> PathBuf {
         let unique = format!(
             "argus-pty-session-{}-{:?}.log",
@@ -826,6 +1123,25 @@ mod tests {
             std::thread::current().id()
         );
         std::env::temp_dir().join(unique)
+    }
+
+    fn unique_log_dir() -> PathBuf {
+        let unique = format!(
+            "argus-session-manager-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        );
+        std::env::temp_dir().join(unique)
+    }
+
+    #[cfg(windows)]
+    fn long_running_shell_command() -> &'static str {
+        "cmd.exe"
+    }
+
+    #[cfg(not(windows))]
+    fn long_running_shell_command() -> &'static str {
+        "/bin/sh"
     }
 
     #[cfg(windows)]
@@ -892,6 +1208,30 @@ mod tests {
             assert!(
                 Instant::now() < deadline,
                 "timed out waiting for session exit; latest snapshot: {:?}",
+                snapshot
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn wait_for_manager_marker(
+        manager: &SessionManager,
+        session_id: SessionId,
+        marker: &str,
+    ) -> SessionSnapshot {
+        let deadline = Instant::now() + Duration::from_secs(5);
+
+        loop {
+            let snapshot = manager
+                .snapshot_session(session_id.clone())
+                .expect("snapshot managed session");
+            if snapshot.visible_rows.iter().any(|row| row.contains(marker)) {
+                return snapshot;
+            }
+
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {marker}; latest snapshot: {:?}",
                 snapshot
             );
             std::thread::sleep(Duration::from_millis(20));

@@ -38,8 +38,8 @@ fn main() -> Result<()> {
 
 fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut LocalSessionApp) -> Result<()> {
     loop {
-        app.drain_events()?;
-        terminal.draw(|frame| draw(frame, app.view(), app.last_error()))?;
+        app.drain_events();
+        terminal.draw(|frame| draw(frame, app))?;
 
         if !event::poll(Duration::from_millis(50))? {
             continue;
@@ -47,11 +47,21 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut LocalSession
 
         match event::read()? {
             Event::Key(key) if should_exit(key) => return Ok(()),
-            Event::Key(key) => {
-                if let Some(bytes) = key_to_input(key) {
-                    app.write_input(bytes);
+            Event::Key(key) => match key_to_command(key) {
+                Some(AppCommand::New) => {
+                    app.create_session(current_session_size()?);
                 }
-            }
+                Some(AppCommand::Close) => {
+                    app.close_selected_session();
+                }
+                Some(AppCommand::Next) => app.select_next_session(),
+                Some(AppCommand::Previous) => app.select_previous_session(),
+                None => {
+                    if let Some(bytes) = key_to_input(key) {
+                        app.write_input(bytes);
+                    }
+                }
+            },
             Event::Resize(cols, rows) => {
                 app.resize(session_size_from_app_terminal(rows, cols));
             }
@@ -60,7 +70,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut LocalSession
     }
 }
 
-fn draw(frame: &mut ratatui::Frame<'_>, view: &SessionView, last_error: Option<&str>) {
+fn draw(frame: &mut ratatui::Frame<'_>, app: &LocalSessionApp) {
     let root = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(1), Constraint::Length(1)])
@@ -70,12 +80,27 @@ fn draw(frame: &mut ratatui::Frame<'_>, view: &SessionView, last_error: Option<&
         .constraints([Constraint::Length(28), Constraint::Min(20)])
         .split(root[0]);
 
-    draw_sidebar(frame, body[0], view);
-    draw_terminal(frame, body[1], view);
-    draw_status(frame, root[1], view, last_error);
+    draw_sidebar(frame, body[0], app);
+    draw_terminal(frame, body[1], app.view());
+    draw_status(frame, root[1], app.view(), app.last_error());
 }
 
-fn draw_sidebar(frame: &mut ratatui::Frame<'_>, area: Rect, view: &SessionView) {
+fn draw_sidebar(frame: &mut ratatui::Frame<'_>, area: Rect, app: &LocalSessionApp) {
+    let rows = app
+        .sessions()
+        .enumerate()
+        .flat_map(|(index, view)| session_sidebar_rows(index, app.selected_index(), view))
+        .collect::<Vec<_>>();
+
+    frame.render_widget(
+        Paragraph::new(rows)
+            .block(Block::default().title("Sessions").borders(Borders::ALL))
+            .wrap(Wrap { trim: true }),
+        area,
+    );
+}
+
+fn session_sidebar_rows(index: usize, selected: usize, view: &SessionView) -> Vec<Line<'static>> {
     let holder = view
         .lease
         .holder
@@ -90,25 +115,26 @@ fn draw_sidebar(frame: &mut ratatui::Frame<'_>, area: Rect, view: &SessionView) 
     } else {
         "running"
     };
-    let rows = vec![
+    let marker = if index == selected { ">" } else { " " };
+    let style = if index == selected {
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
+
+    vec![
         Line::from(Span::styled(
-            view.session_id.to_string(),
-            Style::default().add_modifier(Modifier::BOLD),
+            format!("{marker} {}  {state}", view.session_id),
+            style,
         )),
-        Line::from(format!("state  {state}")),
-        Line::from(format!("lease  {holder}")),
         Line::from(format!(
-            "size   {}x{}",
+            "  {holder}  {}x{}",
             view.snapshot.size.cols, view.snapshot.size.rows
         )),
-    ];
-
-    frame.render_widget(
-        Paragraph::new(rows)
-            .block(Block::default().title("Sessions").borders(Borders::ALL))
-            .wrap(Wrap { trim: true }),
-        area,
-    );
+        Line::from(""),
+    ]
 }
 
 fn draw_terminal(frame: &mut ratatui::Frame<'_>, area: Rect, view: &SessionView) {
@@ -120,12 +146,7 @@ fn draw_terminal(frame: &mut ratatui::Frame<'_>, area: Rect, view: &SessionView)
         .saturating_sub(visible_height);
     let rows = view.snapshot.visible_rows[start..]
         .iter()
-        .map(|row| {
-            Line::from(Span::styled(
-                row.as_str(),
-                Style::default().fg(Color::White),
-            ))
-        })
+        .map(|row| Line::from(row.as_str()))
         .collect::<Vec<_>>();
 
     frame.render_widget(
@@ -145,18 +166,45 @@ fn draw_status(
     let status = if let Some(error) = last_error {
         Line::from(vec![
             Span::styled("error ", Style::default().fg(Color::Red)),
-            Span::raw(error.to_string()),
+            Span::raw(error),
         ])
     } else {
         Line::from(format!(
-            "seq {}  bytes {}  in {}  out {}  Esc/Ctrl-Q exits",
-            view.snapshot.output_seq,
-            view.snapshot.bytes_logged,
-            view.input_bytes_sent,
-            view.output_events_seen
+            "seq {}  bytes {}  Ctrl-N new  Ctrl-W close  Alt-arrows switch  Esc/Ctrl-Q exit",
+            view.snapshot.output_seq, view.snapshot.bytes_logged
         ))
     };
     frame.render_widget(Paragraph::new(status), area);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AppCommand {
+    New,
+    Close,
+    Next,
+    Previous,
+}
+
+fn key_to_command(key: KeyEvent) -> Option<AppCommand> {
+    match key.code {
+        KeyCode::Char('n') | KeyCode::Char('N')
+            if key.modifiers.contains(KeyModifiers::CONTROL) =>
+        {
+            Some(AppCommand::New)
+        }
+        KeyCode::Char('w') | KeyCode::Char('W')
+            if key.modifiers.contains(KeyModifiers::CONTROL) =>
+        {
+            Some(AppCommand::Close)
+        }
+        KeyCode::Down | KeyCode::Right if key.modifiers.contains(KeyModifiers::ALT) => {
+            Some(AppCommand::Next)
+        }
+        KeyCode::Up | KeyCode::Left if key.modifiers.contains(KeyModifiers::ALT) => {
+            Some(AppCommand::Previous)
+        }
+        _ => None,
+    }
 }
 
 fn should_exit(key: KeyEvent) -> bool {
@@ -195,6 +243,10 @@ fn control_byte(character: char) -> Option<u8> {
 }
 
 fn initial_session_size() -> Result<SessionSize> {
+    current_session_size()
+}
+
+fn current_session_size() -> Result<SessionSize> {
     let (cols, rows) = crossterm::terminal::size()?;
     Ok(session_size_from_app_terminal(rows, cols))
 }
@@ -269,6 +321,30 @@ mod tests {
             KeyCode::Char('q'),
             KeyModifiers::NONE,
         )));
+    }
+
+    #[test]
+    fn reserved_control_keys_become_app_commands() {
+        assert_eq!(
+            key_to_command(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL)),
+            Some(AppCommand::New)
+        );
+        assert_eq!(
+            key_to_command(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL)),
+            Some(AppCommand::Close)
+        );
+        assert_eq!(
+            key_to_command(KeyEvent::new(KeyCode::Down, KeyModifiers::ALT)),
+            Some(AppCommand::Next)
+        );
+        assert_eq!(
+            key_to_command(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT)),
+            Some(AppCommand::Previous)
+        );
+        assert_eq!(
+            key_to_command(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+            None
+        );
     }
 
     #[test]

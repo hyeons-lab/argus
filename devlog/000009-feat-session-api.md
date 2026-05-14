@@ -1,0 +1,54 @@
+# Session API
+
+## Agent
+
+Codex
+
+## Intent
+
+Define the shared session API in `argus-core` so daemon, TUI, web, and MCP transports can bind to one set of session commands, snapshots, events, attach modes, and input lease semantics.
+
+## Decisions
+
+- Keep PTY handles, terminal engine state, raw logs, actor threads, and shutdown mechanics in `argus-daemon`.
+- Put transport-neutral identifiers, sizes, snapshots, completed-session summaries, attach modes, lease state, events, and trait contracts in `argus-core`.
+- Model input control as an explicit lease with observer-only attach as the default behavior.
+
+## Progress
+
+- 2026-05-13T19:14-0700 — Created `feat/session-api` worktree from `origin/main` and unset the accidental upstream.
+- 2026-05-13T19:19-0700 — Added `argus-core::session` with shared session identifiers, size/snapshot/completion types, attach modes, input lease state, session events, request/response structs, and the synchronous session API trait.
+- 2026-05-13T19:19-0700 — Updated `argus-daemon` to reuse the shared `SessionSize`, `SessionSnapshot`, and `CompletedSession` types while keeping PTY-specific config and conversion helpers local.
+- 2026-05-13T19:27-0700 — Made the Junie review step non-blocking after PR #11 showed the action can fail from external account balance exhaustion while Rust CI remains green.
+- 2026-05-13T19:36-0700 — Updated the Junie workflow to the current `v1.4.1` action commit and `junie_version: latest` after the user verified their Junie account still had credits.
+
+## What Changed
+
+- Added transport-neutral session IDs, client IDs, session sizing, snapshots, completion summaries, attach modes, input controller kinds, lease state transitions, and session events in `argus-core`.
+- Added request/response structs and a synchronous `SessionApi` trait covering start, attach, input lease, write, resize, snapshot, and shutdown operations.
+- Added unit coverage for observer defaults, input lease acquire/takeover/release behavior, session size validation, and start request validation.
+- Re-exported `argus_core::session` and removed duplicate daemon-local definitions for shared size/snapshot/completion types.
+- Marked the Junie review action as non-blocking so external review-agent quota failures do not fail the branch checks.
+- Updated the Junie action pin from the older commit behind the `v1.4.1` comment to the current `v1.4.1` tag commit and opted into the latest Junie CLI.
+
+## Validation
+
+- `cargo fmt --all -- --check`
+- `cargo test -p argus-core`
+- `cargo test -p argus-daemon`
+- `cargo check --workspace`
+- `cargo test --workspace`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- Inspected PR #11 Junie logs; the failing action reported insufficient Junie account balance before producing its JSON result file.
+- Verified the pinned workflow action was behind the current `v1.4.1` tag.
+
+## Next Steps
+
+- Bind the daemon-local `SessionActor` to the shared `argus-core` session API.
+- Add a daemon session manager that owns multiple actors by `SessionId` and applies input lease decisions before writing PTY input.
+
+## Commits
+
+- 3b4e6f2 — feat: define shared session API
+- 8509ab3 — ci: make Junie review non-blocking
+- HEAD — ci: update Junie review runner

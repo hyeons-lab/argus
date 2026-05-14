@@ -1,0 +1,373 @@
+use std::fmt;
+use std::path::PathBuf;
+
+use anyhow::{Result, ensure};
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct SessionId(String);
+
+impl SessionId {
+    pub fn new(id: impl Into<String>) -> Result<Self> {
+        let id = id.into();
+        ensure!(!id.trim().is_empty(), "session id must be set");
+        Ok(Self(id))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for SessionId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ClientId(String);
+
+impl ClientId {
+    pub fn new(id: impl Into<String>) -> Result<Self> {
+        let id = id.into();
+        ensure!(!id.trim().is_empty(), "client id must be set");
+        Ok(Self(id))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ClientId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSize {
+    pub rows: usize,
+    pub cols: usize,
+    pub pixel_width: usize,
+    pub pixel_height: usize,
+    pub dpi: usize,
+}
+
+impl Default for SessionSize {
+    fn default() -> Self {
+        Self {
+            rows: 24,
+            cols: 80,
+            pixel_width: 800,
+            pixel_height: 480,
+            dpi: 96,
+        }
+    }
+}
+
+impl SessionSize {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(self.rows > 0, "session PTY rows must be greater than zero");
+        ensure!(self.cols > 0, "session PTY cols must be greater than zero");
+        ensure!(
+            self.rows <= u16::MAX as usize,
+            "session PTY rows must fit in u16"
+        );
+        ensure!(
+            self.cols <= u16::MAX as usize,
+            "session PTY cols must fit in u16"
+        );
+        ensure!(
+            self.pixel_width <= u16::MAX as usize,
+            "session PTY pixel width must fit in u16"
+        );
+        ensure!(
+            self.pixel_height <= u16::MAX as usize,
+            "session PTY pixel height must fit in u16"
+        );
+        ensure!(
+            self.dpi <= u32::MAX as usize,
+            "session terminal DPI must fit in u32"
+        );
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSnapshot {
+    pub output_seq: u64,
+    pub bytes_logged: u64,
+    pub size: SessionSize,
+    pub visible_rows: Vec<String>,
+    pub exited: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompletedSession {
+    pub output_seq: u64,
+    pub bytes_logged: u64,
+    pub visible_rows: Vec<String>,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AttachMode {
+    #[default]
+    Observer,
+    InteractiveController,
+    AgentController,
+}
+
+impl AttachMode {
+    pub fn grants_input(self) -> bool {
+        !matches!(self, Self::Observer)
+    }
+
+    pub fn controller_kind(self) -> Option<InputControllerKind> {
+        match self {
+            AttachMode::Observer => None,
+            AttachMode::InteractiveController => Some(InputControllerKind::Interactive),
+            AttachMode::AgentController => Some(InputControllerKind::Agent),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InputControllerKind {
+    Interactive,
+    Agent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InputLeaseHolder {
+    pub client_id: ClientId,
+    pub kind: InputControllerKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InputLeaseState {
+    pub holder: Option<InputLeaseHolder>,
+    pub generation: u64,
+}
+
+impl InputLeaseState {
+    pub fn observer_only() -> Self {
+        Self {
+            holder: None,
+            generation: 0,
+        }
+    }
+
+    pub fn acquire(&mut self, client_id: ClientId, kind: InputControllerKind) -> LeaseChange {
+        let previous = self.holder.replace(InputLeaseHolder { client_id, kind });
+        self.generation += 1;
+        let action = if previous.is_some() {
+            LeaseChangeAction::TakenOver
+        } else {
+            LeaseChangeAction::Acquired
+        };
+        LeaseChange {
+            generation: self.generation,
+            previous,
+            current: self.holder.clone(),
+            action,
+        }
+    }
+
+    pub fn release(&mut self, client_id: &ClientId) -> Option<LeaseChange> {
+        let current = self.holder.as_ref()?;
+        if &current.client_id != client_id {
+            return None;
+        }
+
+        let previous = self.holder.take();
+        self.generation += 1;
+        Some(LeaseChange {
+            generation: self.generation,
+            previous,
+            current: None,
+            action: LeaseChangeAction::Released,
+        })
+    }
+}
+
+impl Default for InputLeaseState {
+    fn default() -> Self {
+        Self::observer_only()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LeaseChangeAction {
+    Acquired,
+    Released,
+    TakenOver,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeaseChange {
+    pub generation: u64,
+    pub previous: Option<InputLeaseHolder>,
+    pub current: Option<InputLeaseHolder>,
+    pub action: LeaseChangeAction,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StartSessionRequest {
+    pub command: String,
+    pub args: Vec<String>,
+    pub cwd: Option<PathBuf>,
+    pub size: SessionSize,
+}
+
+impl StartSessionRequest {
+    pub fn new(command: impl Into<String>) -> Self {
+        Self {
+            command: command.into(),
+            args: Vec::new(),
+            cwd: None,
+            size: SessionSize::default(),
+        }
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            !self.command.trim().is_empty(),
+            "session command must be set"
+        );
+        self.size.validate()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttachSessionRequest {
+    pub session_id: SessionId,
+    pub client_id: ClientId,
+    pub mode: AttachMode,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttachSessionResponse {
+    pub snapshot: SessionSnapshot,
+    pub lease: InputLeaseState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WriteInputRequest {
+    pub session_id: SessionId,
+    pub client_id: ClientId,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResizeSessionRequest {
+    pub session_id: SessionId,
+    pub size: SessionSize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InputLeaseRequest {
+    pub session_id: SessionId,
+    pub client_id: ClientId,
+    pub kind: InputControllerKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SessionEvent {
+    Output {
+        session_id: SessionId,
+        output_seq: u64,
+        bytes: Vec<u8>,
+    },
+    Snapshot {
+        session_id: SessionId,
+        snapshot: SessionSnapshot,
+    },
+    LeaseChanged {
+        session_id: SessionId,
+        change: LeaseChange,
+    },
+    Exited {
+        session_id: SessionId,
+        completed: CompletedSession,
+    },
+}
+
+pub trait SessionApi {
+    fn start_session(&self, request: StartSessionRequest) -> Result<SessionId>;
+    fn attach_session(&self, request: AttachSessionRequest) -> Result<AttachSessionResponse>;
+    fn acquire_input_lease(&self, request: InputLeaseRequest) -> Result<LeaseChange>;
+    fn release_input_lease(
+        &self,
+        session_id: SessionId,
+        client_id: ClientId,
+    ) -> Result<LeaseChange>;
+    fn write_input(&self, request: WriteInputRequest) -> Result<()>;
+    fn resize_session(&self, request: ResizeSessionRequest) -> Result<SessionSnapshot>;
+    fn snapshot_session(&self, session_id: SessionId) -> Result<SessionSnapshot>;
+    fn shutdown_session(&self, session_id: SessionId) -> Result<CompletedSession>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn observer_attach_is_default_and_does_not_grant_input() {
+        assert_eq!(AttachMode::default(), AttachMode::Observer);
+        assert!(!AttachMode::Observer.grants_input());
+        assert!(AttachMode::InteractiveController.grants_input());
+        assert!(AttachMode::AgentController.grants_input());
+    }
+
+    #[test]
+    fn input_lease_tracks_acquire_takeover_and_release() {
+        let mut lease = InputLeaseState::default();
+        let tui = ClientId::new("local-tui").expect("client id");
+        let agent = ClientId::new("agent").expect("client id");
+
+        let acquired = lease.acquire(tui.clone(), InputControllerKind::Interactive);
+        assert_eq!(acquired.action, LeaseChangeAction::Acquired);
+        assert_eq!(acquired.generation, 1);
+        assert_eq!(lease.holder.as_ref().unwrap().client_id, tui);
+
+        let takeover = lease.acquire(agent.clone(), InputControllerKind::Agent);
+        assert_eq!(takeover.action, LeaseChangeAction::TakenOver);
+        assert_eq!(takeover.generation, 2);
+        assert_eq!(takeover.previous.unwrap().client_id, tui);
+        assert_eq!(lease.holder.as_ref().unwrap().client_id, agent);
+
+        assert!(lease.release(&tui).is_none());
+        let released = lease.release(&agent).expect("release current holder");
+        assert_eq!(released.action, LeaseChangeAction::Released);
+        assert_eq!(released.generation, 3);
+        assert!(lease.holder.is_none());
+    }
+
+    #[test]
+    fn session_size_validates_transport_bounds() {
+        SessionSize::default().validate().expect("default size");
+
+        let size = SessionSize {
+            rows: 0,
+            ..SessionSize::default()
+        };
+        assert!(size.validate().is_err());
+
+        let size = SessionSize {
+            cols: u16::MAX as usize + 1,
+            ..SessionSize::default()
+        };
+        assert!(size.validate().is_err());
+    }
+
+    #[test]
+    fn start_session_request_requires_command_and_valid_size() {
+        let request = StartSessionRequest::new("/bin/sh");
+        request.validate().expect("valid request");
+
+        let request = StartSessionRequest::new(" ");
+        assert!(request.validate().is_err());
+    }
+}

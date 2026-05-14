@@ -31,8 +31,9 @@ jobs:
       - name: Run Junie review
         # JetBrains/junie-github-action@v1.4.1
         continue-on-error: true
-        uses: JetBrains/junie-github-action@f36d694fb571e0c0103d14bfa818a7ff1d1d35ed
+        uses: JetBrains/junie-github-action@fe548a7e4054c23c5314631757f7cd5abab8a0cf
         with:
           junie_api_key: ${{ secrets.JUNIE_API_KEY }}
+          junie_version: latest
           prompt: code-review
           use_single_comment: true

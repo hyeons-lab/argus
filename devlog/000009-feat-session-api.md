@@ -20,6 +20,7 @@ Define the shared session API in `argus-core` so daemon, TUI, web, and MCP trans
 - 2026-05-13T19:19-0700 — Added `argus-core::session` with shared session identifiers, size/snapshot/completion types, attach modes, input lease state, session events, request/response structs, and the synchronous session API trait.
 - 2026-05-13T19:19-0700 — Updated `argus-daemon` to reuse the shared `SessionSize`, `SessionSnapshot`, and `CompletedSession` types while keeping PTY-specific config and conversion helpers local.
 - 2026-05-13T19:27-0700 — Made the Junie review step non-blocking after PR #11 showed the action can fail from external account balance exhaustion while Rust CI remains green.
+- 2026-05-13T19:36-0700 — Updated the Junie workflow to the current `v1.4.1` action commit and `junie_version: latest` after the user verified their Junie account still had credits.
 
 ## What Changed
 
@@ -28,6 +29,7 @@ Define the shared session API in `argus-core` so daemon, TUI, web, and MCP trans
 - Added unit coverage for observer defaults, input lease acquire/takeover/release behavior, session size validation, and start request validation.
 - Re-exported `argus_core::session` and removed duplicate daemon-local definitions for shared size/snapshot/completion types.
 - Marked the Junie review action as non-blocking so external review-agent quota failures do not fail the branch checks.
+- Updated the Junie action pin from the older commit behind the `v1.4.1` comment to the current `v1.4.1` tag commit and opted into the latest Junie CLI.
 
 ## Validation
 
@@ -38,6 +40,7 @@ Define the shared session API in `argus-core` so daemon, TUI, web, and MCP trans
 - `cargo test --workspace`
 - `cargo clippy --all-targets --all-features -- -D warnings`
 - Inspected PR #11 Junie logs; the failing action reported insufficient Junie account balance before producing its JSON result file.
+- Verified the pinned workflow action was behind the current `v1.4.1` tag.
 
 ## Next Steps
 
@@ -47,4 +50,5 @@ Define the shared session API in `argus-core` so daemon, TUI, web, and MCP trans
 ## Commits
 
 - 3b4e6f2 — feat: define shared session API
-- HEAD — ci: make Junie review non-blocking
+- 8509ab3 — ci: make Junie review non-blocking
+- HEAD — ci: update Junie review runner

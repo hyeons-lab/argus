@@ -7,77 +7,10 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, ensure};
+use argus_core::session::{CompletedSession, SessionSize, SessionSnapshot};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use wezterm_term::color::ColorPalette;
 use wezterm_term::{Terminal, TerminalConfiguration, TerminalSize};
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SessionSize {
-    pub rows: usize,
-    pub cols: usize,
-    pub pixel_width: usize,
-    pub pixel_height: usize,
-    pub dpi: usize,
-}
-
-impl Default for SessionSize {
-    fn default() -> Self {
-        Self {
-            rows: 24,
-            cols: 80,
-            pixel_width: 800,
-            pixel_height: 480,
-            dpi: 96,
-        }
-    }
-}
-
-impl SessionSize {
-    fn validate(&self) -> Result<()> {
-        ensure!(self.rows > 0, "session PTY rows must be greater than zero");
-        ensure!(self.cols > 0, "session PTY cols must be greater than zero");
-        ensure!(
-            self.rows <= u16::MAX as usize,
-            "session PTY rows must fit in u16"
-        );
-        ensure!(
-            self.cols <= u16::MAX as usize,
-            "session PTY cols must fit in u16"
-        );
-        ensure!(
-            self.pixel_width <= u16::MAX as usize,
-            "session PTY pixel width must fit in u16"
-        );
-        ensure!(
-            self.pixel_height <= u16::MAX as usize,
-            "session PTY pixel height must fit in u16"
-        );
-        ensure!(
-            self.dpi <= u32::MAX as usize,
-            "session terminal DPI must fit in u32"
-        );
-        Ok(())
-    }
-
-    fn pty_size(&self) -> PtySize {
-        PtySize {
-            rows: self.rows as u16,
-            cols: self.cols as u16,
-            pixel_width: self.pixel_width as u16,
-            pixel_height: self.pixel_height as u16,
-        }
-    }
-
-    fn terminal_size(&self) -> TerminalSize {
-        TerminalSize {
-            rows: self.rows,
-            cols: self.cols,
-            pixel_width: self.pixel_width,
-            pixel_height: self.pixel_height,
-            dpi: self.dpi as u32,
-        }
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionConfig {
@@ -123,22 +56,6 @@ pub struct PtySession {
     reader: Box<dyn Read + Send>,
     _writer: Box<dyn Write + Send>,
     output: OutputState,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CompletedSession {
-    pub output_seq: u64,
-    pub bytes_logged: u64,
-    pub visible_rows: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SessionSnapshot {
-    pub output_seq: u64,
-    pub bytes_logged: u64,
-    pub size: SessionSize,
-    pub visible_rows: Vec<String>,
-    pub exited: bool,
 }
 
 pub struct SessionActor {
@@ -447,9 +364,9 @@ impl ActorState {
     fn resize(&mut self, size: SessionSize) -> Result<SessionSnapshot> {
         size.validate()?;
         self.master
-            .resize(size.pty_size())
+            .resize(pty_size(&size))
             .context("resizing PTY")?;
-        self.output.terminal.resize(size.terminal_size());
+        self.output.terminal.resize(terminal_size(&size));
         self.size = size;
         Ok(self.snapshot())
     }
@@ -566,7 +483,7 @@ fn spawn_pty_runtime(config: SessionConfig) -> Result<PtyRuntime> {
 
     let pty_system = native_pty_system();
     let pair = pty_system
-        .openpty(config.size.pty_size())
+        .openpty(pty_size(&config.size))
         .context("opening PTY")?;
 
     let mut command = CommandBuilder::new(&config.command);
@@ -595,7 +512,7 @@ fn spawn_pty_runtime(config: SessionConfig) -> Result<PtyRuntime> {
         .open(&config.log_path)
         .with_context(|| format!("opening session log {}", config.log_path.display()))?;
     let terminal = Terminal::new(
-        config.size.terminal_size(),
+        terminal_size(&config.size),
         Arc::new(ArgusTerminalConfig),
         "Argus",
         env!("CARGO_PKG_VERSION"),
@@ -615,6 +532,25 @@ fn spawn_pty_runtime(config: SessionConfig) -> Result<PtyRuntime> {
         },
         size: config.size,
     })
+}
+
+fn pty_size(size: &SessionSize) -> PtySize {
+    PtySize {
+        rows: size.rows as u16,
+        cols: size.cols as u16,
+        pixel_width: size.pixel_width as u16,
+        pixel_height: size.pixel_height as u16,
+    }
+}
+
+fn terminal_size(size: &SessionSize) -> TerminalSize {
+    TerminalSize {
+        rows: size.rows,
+        cols: size.cols,
+        pixel_width: size.pixel_width,
+        pixel_height: size.pixel_height,
+        dpi: size.dpi as u32,
+    }
 }
 
 fn read_pty_output(mut reader: Box<dyn Read + Send>, tx: SyncSender<ActorMessage>) {

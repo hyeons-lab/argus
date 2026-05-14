@@ -20,6 +20,7 @@ Bind the daemon session actor to the shared `argus-core` session API with daemon
 - 2026-05-13T20:21-0700 — Created `feat/daemon-session-manager` worktree from `origin/main` and unset the accidental upstream.
 - 2026-05-13T20:25-0700 — Added an in-process daemon session manager implementing the shared session API over `SessionActor`.
 - 2026-05-13T20:25-0700 — Added daemon coverage for observer write rejection, controller lease acquisition, agent takeover, release, managed snapshot polling, log tee, and shutdown.
+- 2026-05-13T20:36-0700 — Investigated PR #12 macOS CI failure and found the Rust cache restoring `~/.cargo/bin` so `cargo test` executed `rustup-init`; disabled binary caching in the Rust cache steps.
 
 ## What Changed
 
@@ -28,6 +29,7 @@ Bind the daemon session actor to the shared `argus-core` session API with daemon
 - Added daemon-owned session ID allocation and per-session log path creation under the configured log directory.
 - Enforced input lease ownership before forwarding input bytes to the PTY actor.
 - Added a managed-session integration test around attach/write/takeover/release/shutdown behavior.
+- Disabled `Swatinem/rust-cache` binary caching so CI does not restore stale or invalid Cargo/Rustup shims over the toolchain action's install.
 
 ## Validation
 
@@ -37,6 +39,7 @@ Bind the daemon session actor to the shared `argus-core` session API with daemon
 - `cargo test --workspace`
 - `cargo clippy --all-targets --all-features -- -D warnings`
 - `git diff --check`
+- Inspected PR #12 macOS job logs; the failing command was `cargo test --workspace --all-features --locked`, but the binary reported `Usage: rustup-init[EXE] [OPTIONS]`.
 
 ## Next Steps
 
@@ -45,4 +48,5 @@ Bind the daemon session actor to the shared `argus-core` session API with daemon
 
 ## Commits
 
-- HEAD — feat: add daemon session manager
+- 793bbd5 — feat: add daemon session manager
+- HEAD — ci: stop caching cargo binaries

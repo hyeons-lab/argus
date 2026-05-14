@@ -13,8 +13,9 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, ensure};
 use argus_core::session::{
     AttachSessionRequest, AttachSessionResponse, ClientId, CompletedSession, InputLeaseRequest,
-    InputLeaseState, LeaseChange, ResizeSessionRequest, SessionApi, SessionId, SessionSize,
-    SessionSnapshot, StartSessionRequest, WriteInputRequest,
+    InputLeaseState, LeaseChange, ResizeSessionRequest, SessionApi, SessionEvent,
+    SessionEventReceiver, SessionId, SessionSize, SessionSnapshot, StartSessionRequest,
+    WriteInputRequest,
 };
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use wezterm_term::color::ColorPalette;
@@ -143,7 +144,7 @@ impl SessionApi for SessionManager {
             size: request.size,
             log_path,
         };
-        let actor = SessionActor::spawn(config)?;
+        let actor = SessionActor::spawn_managed(config, session_id.clone())?;
 
         let mut sessions = self.sessions()?;
         sessions.insert(
@@ -163,7 +164,11 @@ impl SessionApi for SessionManager {
             .with_context(|| format!("session {} not found", request.session_id))?;
 
         if let Some(kind) = request.mode.controller_kind() {
-            session.lease.acquire(request.client_id, kind);
+            let change = session.lease.acquire(request.client_id, kind);
+            session.actor.broadcast_event(SessionEvent::LeaseChanged {
+                session_id: request.session_id.clone(),
+                change,
+            })?;
         }
 
         Ok(AttachSessionResponse {
@@ -172,12 +177,25 @@ impl SessionApi for SessionManager {
         })
     }
 
+    fn subscribe_session_events(&self, session_id: SessionId) -> Result<SessionEventReceiver> {
+        let sessions = self.sessions()?;
+        let session = sessions
+            .get(&session_id)
+            .with_context(|| format!("session {session_id} not found"))?;
+        session.actor.subscribe_events()
+    }
+
     fn acquire_input_lease(&self, request: InputLeaseRequest) -> Result<LeaseChange> {
         let mut sessions = self.sessions()?;
         let session = sessions
             .get_mut(&request.session_id)
             .with_context(|| format!("session {} not found", request.session_id))?;
-        Ok(session.lease.acquire(request.client_id, request.kind))
+        let change = session.lease.acquire(request.client_id, request.kind);
+        session.actor.broadcast_event(SessionEvent::LeaseChanged {
+            session_id: request.session_id,
+            change: change.clone(),
+        })?;
+        Ok(change)
     }
 
     fn release_input_lease(
@@ -189,10 +207,15 @@ impl SessionApi for SessionManager {
         let session = sessions
             .get_mut(&session_id)
             .with_context(|| format!("session {session_id} not found"))?;
-        session
+        let change = session
             .lease
             .release(&client_id)
-            .with_context(|| format!("client {client_id} does not hold input lease"))
+            .with_context(|| format!("client {client_id} does not hold input lease"))?;
+        session.actor.broadcast_event(SessionEvent::LeaseChanged {
+            session_id,
+            change: change.clone(),
+        })?;
+        Ok(change)
     }
 
     fn write_input(&self, request: WriteInputRequest) -> Result<()> {
@@ -301,6 +324,17 @@ fn default_log_dir() -> PathBuf {
 
 impl SessionActor {
     pub fn spawn(config: SessionConfig) -> Result<Self> {
+        Self::spawn_with_events(config, None)
+    }
+
+    fn spawn_managed(config: SessionConfig, session_id: SessionId) -> Result<Self> {
+        Self::spawn_with_events(config, Some(session_id))
+    }
+
+    fn spawn_with_events(
+        config: SessionConfig,
+        event_session_id: Option<SessionId>,
+    ) -> Result<Self> {
         let runtime = spawn_pty_runtime(config)?;
         let PtyRuntime {
             master,
@@ -328,6 +362,9 @@ impl SessionActor {
                     size,
                     exited: false,
                     output_closed: false,
+                    exit_broadcasted: false,
+                    event_session_id,
+                    subscribers: Vec::new(),
                 };
                 run_actor(state, command_rx, output_rx);
             })
@@ -338,6 +375,25 @@ impl SessionActor {
             worker: Some(worker),
             reader: Some(reader),
         })
+    }
+
+    pub fn subscribe_events(&self) -> Result<SessionEventReceiver> {
+        let (tx, rx) = mpsc::channel();
+        self.tx
+            .send(ActorCommand::SubscribeEvents { response: tx })
+            .context("sending session event subscription command")?;
+        recv_actor_result(rx, "subscribing to session events")
+    }
+
+    pub fn broadcast_event(&self, event: SessionEvent) -> Result<()> {
+        let (tx, rx) = mpsc::channel();
+        self.tx
+            .send(ActorCommand::BroadcastEvent {
+                event,
+                response: tx,
+            })
+            .context("sending session event broadcast command")?;
+        recv_actor_result(rx, "broadcasting session event")
     }
 
     pub fn write_input(&self, bytes: impl Into<Vec<u8>>) -> Result<()> {
@@ -414,6 +470,9 @@ struct ActorState {
     size: SessionSize,
     exited: bool,
     output_closed: bool,
+    exit_broadcasted: bool,
+    event_session_id: Option<SessionId>,
+    subscribers: Vec<Sender<SessionEvent>>,
 }
 
 struct PtyRuntime {
@@ -448,6 +507,13 @@ enum ActorCommand {
     },
     Snapshot {
         response: Sender<ActorResult<SessionSnapshot>>,
+    },
+    SubscribeEvents {
+        response: Sender<ActorResult<SessionEventReceiver>>,
+    },
+    BroadcastEvent {
+        event: SessionEvent,
+        response: Sender<ActorResult<()>>,
     },
     Shutdown {
         response: Sender<ActorResult<CompletedSession>>,
@@ -491,6 +557,7 @@ fn run_actor(
             Err(RecvTimeoutError::Disconnected) => {
                 state.output_closed = true;
                 state.mark_exited();
+                state.broadcast_exit();
             }
         }
     }
@@ -502,6 +569,12 @@ impl ActorState {
             ActorMessage::Output(bytes) => {
                 if let Err(error) = self.output.ingest(&bytes) {
                     tracing::warn!(error = ?error, "failed to ingest PTY output");
+                } else if let Some(session_id) = self.event_session_id.clone() {
+                    self.broadcast(SessionEvent::Output {
+                        session_id,
+                        output_seq: self.output.output_seq,
+                        bytes,
+                    });
                 }
             }
             ActorMessage::OutputClosed(result) => {
@@ -510,6 +583,7 @@ impl ActorState {
                 }
                 self.output_closed = true;
                 self.mark_exited();
+                self.broadcast_exit();
             }
         }
     }
@@ -531,6 +605,15 @@ impl ActorState {
             }
             ActorCommand::Snapshot { response } => {
                 let _ = response.send(Ok(self.snapshot()));
+                false
+            }
+            ActorCommand::SubscribeEvents { response } => {
+                let _ = response.send(self.subscribe_events());
+                false
+            }
+            ActorCommand::BroadcastEvent { event, response } => {
+                self.broadcast(event);
+                let _ = response.send(Ok(()));
                 false
             }
             ActorCommand::Shutdown { response } => {
@@ -556,7 +639,14 @@ impl ActorState {
             .context("resizing PTY")?;
         self.output.terminal.resize(terminal_size(&size));
         self.size = size;
-        Ok(self.snapshot())
+        let snapshot = self.snapshot();
+        if let Some(session_id) = self.event_session_id.clone() {
+            self.broadcast(SessionEvent::Snapshot {
+                session_id,
+                snapshot: snapshot.clone(),
+            });
+        }
+        Ok(snapshot)
     }
 
     fn snapshot(&self) -> SessionSnapshot {
@@ -585,11 +675,55 @@ impl ActorState {
         self.reap_child();
         self.output.log.flush().context("flushing session log")?;
 
-        Ok(CompletedSession {
+        let completed = self.completed_session();
+        self.broadcast_completed(completed.clone());
+
+        Ok(completed)
+    }
+
+    fn subscribe_events(&mut self) -> Result<SessionEventReceiver> {
+        ensure!(
+            self.event_session_id.is_some(),
+            "session actor was not configured for event fan-out"
+        );
+        let (tx, rx) = mpsc::channel();
+        self.subscribers.push(tx);
+        Ok(rx)
+    }
+
+    fn broadcast(&mut self, event: SessionEvent) {
+        self.subscribers
+            .retain(|subscriber| subscriber.send(event.clone()).is_ok());
+    }
+
+    fn broadcast_exit(&mut self) {
+        if !self.exited || self.exit_broadcasted {
+            return;
+        }
+
+        self.broadcast_completed(self.completed_session());
+    }
+
+    fn broadcast_completed(&mut self, completed: CompletedSession) {
+        if self.exit_broadcasted {
+            return;
+        }
+
+        if let Some(session_id) = self.event_session_id.clone() {
+            self.broadcast(SessionEvent::Exited {
+                session_id,
+                completed,
+            });
+        }
+        self.exit_broadcasted = true;
+    }
+
+    fn completed_session(&self) -> CompletedSession {
+        CompletedSession {
             output_seq: self.output.output_seq,
             bytes_logged: self.output.bytes_logged,
             visible_rows: visible_rows(&self.output.terminal),
-        })
+        }
     }
 
     fn mark_exited(&mut self) {
@@ -634,6 +768,12 @@ impl ActorState {
                 Ok(ActorMessage::Output(bytes)) => {
                     if let Err(error) = self.output.ingest(&bytes) {
                         tracing::warn!(error = ?error, "failed to ingest PTY output during shutdown");
+                    } else if let Some(session_id) = self.event_session_id.clone() {
+                        self.broadcast(SessionEvent::Output {
+                            session_id,
+                            output_seq: self.output.output_seq,
+                            bytes,
+                        });
                     }
                 }
                 Ok(ActorMessage::OutputClosed(result)) => {
@@ -642,11 +782,13 @@ impl ActorState {
                     }
                     self.output_closed = true;
                     self.exited = true;
+                    self.broadcast_exit();
                     break;
                 }
                 Err(RecvTimeoutError::Timeout) => break,
                 Err(RecvTimeoutError::Disconnected) => {
                     self.output_closed = true;
+                    self.broadcast_exit();
                     break;
                 }
             }
@@ -794,6 +936,12 @@ fn reject_command_during_shutdown(command: ActorCommand) {
             let _ = response.send(Err(error));
         }
         ActorCommand::Snapshot { response } => {
+            let _ = response.send(Err(error));
+        }
+        ActorCommand::SubscribeEvents { response } => {
+            let _ = response.send(Err(error));
+        }
+        ActorCommand::BroadcastEvent { response, .. } => {
             let _ = response.send(Err(error));
         }
         ActorCommand::Shutdown { response } => {
@@ -1116,6 +1264,110 @@ mod tests {
         );
     }
 
+    #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "portable-pty ConPTY EOF handling needs a dedicated Windows lifecycle test"
+    )]
+    fn session_manager_fans_out_session_events_to_subscribers() {
+        let log_dir = unique_log_dir();
+        let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
+        let mut request = StartSessionRequest::new(long_running_shell_command());
+        request.size = SessionSize {
+            rows: 6,
+            cols: 40,
+            pixel_width: 800,
+            pixel_height: 240,
+            dpi: 96,
+        };
+        let session_id = manager.start_session(request).expect("start session");
+        let local_tui = ClientId::new("local-tui").expect("local tui id");
+        let first_subscriber = manager
+            .subscribe_session_events(session_id.clone())
+            .expect("subscribe first client");
+        let second_subscriber = manager
+            .subscribe_session_events(session_id.clone())
+            .expect("subscribe second client");
+
+        manager
+            .acquire_input_lease(InputLeaseRequest {
+                session_id: session_id.clone(),
+                client_id: local_tui.clone(),
+                kind: argus_core::session::InputControllerKind::Interactive,
+            })
+            .expect("acquire input lease");
+        assert!(matches!(
+            wait_for_event(&first_subscriber, "first lease event", |event| {
+                matches!(
+                    event,
+                    SessionEvent::LeaseChanged { session_id: event_session_id, change }
+                        if event_session_id == &session_id
+                            && change.action == argus_core::session::LeaseChangeAction::Acquired
+                )
+            }),
+            SessionEvent::LeaseChanged { .. }
+        ));
+        assert!(matches!(
+            wait_for_event(&second_subscriber, "second lease event", |event| {
+                matches!(
+                    event,
+                    SessionEvent::LeaseChanged { session_id: event_session_id, change }
+                        if event_session_id == &session_id
+                            && change.action == argus_core::session::LeaseChangeAction::Acquired
+                )
+            }),
+            SessionEvent::LeaseChanged { .. }
+        ));
+
+        manager
+            .write_input(WriteInputRequest {
+                session_id: session_id.clone(),
+                client_id: local_tui,
+                bytes: input_that_prints_marker(),
+            })
+            .expect("write PTY input");
+        wait_for_output_event(&first_subscriber, &session_id, "actor-ready");
+        wait_for_output_event(&second_subscriber, &session_id, "actor-ready");
+
+        manager
+            .resize_session(ResizeSessionRequest {
+                session_id: session_id.clone(),
+                size: SessionSize {
+                    rows: 8,
+                    cols: 48,
+                    pixel_width: 960,
+                    pixel_height: 320,
+                    dpi: 96,
+                },
+            })
+            .expect("resize managed session");
+        assert!(matches!(
+            wait_for_event(&first_subscriber, "resize snapshot event", |event| {
+                matches!(
+                    event,
+                    SessionEvent::Snapshot { session_id: event_session_id, snapshot }
+                        if event_session_id == &session_id && snapshot.size.rows == 8
+                )
+            }),
+            SessionEvent::Snapshot { .. }
+        ));
+
+        manager
+            .shutdown_session(session_id.clone())
+            .expect("shutdown managed session");
+        assert!(matches!(
+            wait_for_event(&first_subscriber, "exit event", |event| {
+                matches!(
+                    event,
+                    SessionEvent::Exited { session_id: event_session_id, completed }
+                        if event_session_id == &session_id && completed.output_seq > 0
+                )
+            }),
+            SessionEvent::Exited { .. }
+        ));
+        let _ = std::fs::remove_dir_all(&log_dir);
+    }
+
     fn unique_log_path() -> PathBuf {
         let unique = format!(
             "argus-pty-session-{}-{:?}.log",
@@ -1235,6 +1487,42 @@ mod tests {
                 snapshot
             );
             std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn wait_for_output_event(
+        receiver: &SessionEventReceiver,
+        session_id: &SessionId,
+        marker: &str,
+    ) -> SessionEvent {
+        wait_for_event(receiver, "output event", |event| {
+            matches!(
+                event,
+                SessionEvent::Output { session_id: event_session_id, bytes, .. }
+                    if event_session_id == session_id
+                        && String::from_utf8_lossy(bytes).contains(marker)
+            )
+        })
+    }
+
+    fn wait_for_event(
+        receiver: &SessionEventReceiver,
+        label: &str,
+        matches_event: impl Fn(&SessionEvent) -> bool,
+    ) -> SessionEvent {
+        let deadline = Instant::now() + Duration::from_secs(5);
+
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(!remaining.is_zero(), "timed out waiting for {label}");
+            match receiver.recv_timeout(remaining.min(Duration::from_millis(100))) {
+                Ok(event) if matches_event(&event) => return event,
+                Ok(_) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    panic!("event stream closed while waiting for {label}");
+                }
+            }
         }
     }
 }

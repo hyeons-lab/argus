@@ -7,6 +7,8 @@ use argus_core::session::{
     ResizeSessionRequest, SessionApi, SessionEvent, SessionEventReceiver, SessionId, SessionSize,
     SessionSnapshot, StartSessionRequest, WriteInputRequest,
 };
+#[cfg(unix)]
+use argus_daemon::ipc::UnixSocketClient;
 use argus_daemon::session::{SessionManager, SessionManagerConfig};
 
 const MAX_EVENTS_PER_SESSION_TICK: usize = 256;
@@ -20,7 +22,7 @@ pub struct SessionView {
 }
 
 pub struct LocalSessionApp {
-    manager: SessionManager,
+    manager: Box<dyn SessionApi>,
     client_id: ClientId,
     sessions: Vec<SessionRuntime>,
     selected: usize,
@@ -37,10 +39,20 @@ impl LocalSessionApp {
         Self::start_with_log_dir(size, default_tui_log_dir())
     }
 
+    #[cfg(unix)]
+    pub fn connect(socket_path: impl Into<PathBuf>, size: SessionSize) -> Result<Self> {
+        let manager = UnixSocketClient::new(socket_path);
+        Self::start_with_manager(Box::new(manager), size)
+    }
+
     fn start_with_log_dir(size: SessionSize, log_dir: PathBuf) -> Result<Self> {
         let manager = SessionManager::new(SessionManagerConfig::new(log_dir));
+        Self::start_with_manager(Box::new(manager), size)
+    }
+
+    fn start_with_manager(manager: Box<dyn SessionApi>, size: SessionSize) -> Result<Self> {
         let client_id = ClientId::new("local-tui")?;
-        let session = start_local_session(&manager, &client_id, size)?;
+        let session = start_local_session(manager.as_ref(), &client_id, size)?;
 
         Ok(Self {
             manager,
@@ -52,7 +64,7 @@ impl LocalSessionApp {
     }
 
     pub fn create_session(&mut self, size: SessionSize) {
-        match start_local_session(&self.manager, &self.client_id, size) {
+        match start_local_session(self.manager.as_ref(), &self.client_id, size) {
             Ok(session) => {
                 self.sessions.push(session);
                 self.selected = self.sessions.len() - 1;
@@ -219,7 +231,7 @@ impl LocalSessionApp {
 }
 
 fn start_local_session(
-    manager: &SessionManager,
+    manager: &dyn SessionApi,
     client_id: &ClientId,
     size: SessionSize,
 ) -> Result<SessionRuntime> {
@@ -227,12 +239,24 @@ fn start_local_session(
     request.size = size;
 
     let session_id = manager.start_session(request)?;
-    let events = manager.subscribe_session_events(session_id.clone())?;
-    let attached = manager.attach_session(AttachSessionRequest {
+    let events = match manager.subscribe_session_events(session_id.clone()) {
+        Ok(events) => events,
+        Err(error) => {
+            let _ = manager.shutdown_session(session_id);
+            return Err(error);
+        }
+    };
+    let attached = match manager.attach_session(AttachSessionRequest {
         session_id: session_id.clone(),
         client_id: client_id.clone(),
         mode: AttachMode::InteractiveController,
-    })?;
+    }) {
+        Ok(attached) => attached,
+        Err(error) => {
+            let _ = manager.shutdown_session(session_id);
+            return Err(error);
+        }
+    };
 
     Ok(SessionRuntime {
         events,

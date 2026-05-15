@@ -11,6 +11,8 @@ authors.workspace = true
 argus-core = { path = "../argus-core" }
 anyhow.workspace = true
 portable-pty.workspace = true
+serde = { workspace = true }
+serde_json.workspace = true
 tracing.workspace = true
 wezterm-term.workspace = true
 

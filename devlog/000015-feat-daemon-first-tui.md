@@ -40,13 +40,20 @@
 - Bounded unterminated OSC 7 cwd parsing buffers and gave each TUI app instance a unique local client id so daemon input leases are not shared by simultaneous TUIs.
 - Removed terminal mouse capture so the terminal emulator keeps ownership of text selection and copy/paste; PageUp/PageDown remain the TUI scrollback controls.
 - Restored terminal mouse capture and routed mouse wheel events to selected-session scrollback so wheel input does not reach the child shell as history navigation.
+- Removed terminal mouse capture again because native terminal text selection and copy/paste are higher priority than mouse-wheel TUI scrollback; PageUp/PageDown remain available for Argus scrollback.
+- Reintroduced TUI-owned mouse mode with pane-local wheel scrolling, visual terminal-pane selection, and OSC 52 clipboard copy so selection cannot include the sessions sidebar.
+- Made `Ctrl-C` copy and clear an active terminal-pane selection instead of forwarding interrupt input to the child process; `Ctrl-C` still forwards normally when there is no selection.
+- Normalized bare line-feed bytes to CRLF only for the daemon terminal model so hook/status output with `\n` separators renders as separate left-aligned rows while raw PTY logs stay unchanged.
+- Reduced scrollback-heavy render latency by drawing only the visible TUI pane rows and limiting expensive styled snapshot rows to the daemon terminal's live physical viewport.
+- Preserved the visible scrollback anchor when new daemon snapshots append rows while the TUI is scrolled back; views at the bottom still follow new output.
 
 ## Commits
 - 472806b — feat: make TUI daemon-first
 - 1c53b54 — fix: clean up TUI startup options
 - 45ce48d — fix: preserve TUI session cwd and styles
 - d93e7fc — fix: restore TUI mouse wheel scrollback
-- HEAD — fix: satisfy daemon IPC clippy lint
+- bf8d127 — fix: satisfy daemon IPC clippy lint
+- HEAD — fix: polish terminal selection and rendering
 
 ## Progress
 - 2026-05-14T18:00-0700 — Created `feat/daemon-first-tui` worktree from `origin/main`, unset the accidental upstream, and inspected the current TUI socket fallback.
@@ -86,3 +93,14 @@
 - 2026-05-15T07:30-0700 — Validation passed: `cargo fmt --all -- --check` and `/home/dberrios/.cargo/bin/cargo test -p argus-tui -p argus-daemon`.
 - 2026-05-15T07:32-0700 — Fixed CI's `clippy::collapsible-if` warning in the Unix socket disconnect handler after the pushed run failed in Format and Lint.
 - 2026-05-15T07:33-0700 — Validation passed: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`, and `/home/dberrios/.cargo/bin/cargo test -p argus-tui -p argus-daemon`.
+- 2026-05-15T07:39-0700 — Checked PR #17 CI: Format and Lint plus macOS, Ubuntu, and Windows tests all passed. Removed TUI mouse capture again after manual copy/selection feedback, accepting keyboard-only Argus scrollback controls for now.
+- 2026-05-15T07:49-0700 — Rechecked PR #17 CI: Format and Lint plus macOS, Ubuntu, and Windows tests all passed. Implemented pane-local mouse handling so wheel events scroll Argus history while drag selection is clamped to the terminal pane and copied via OSC 52 on mouse release.
+- 2026-05-15T07:49-0700 — Validation passed: `cargo fmt --all -- --check`, `/home/dberrios/.cargo/bin/cargo test -p argus-tui`, `cargo clippy -p argus-tui --all-targets --all-features --locked -- -D warnings`, and `/home/dberrios/.cargo/bin/cargo test -p argus-daemon`.
+- 2026-05-15T08:27-0700 — Fixed bare-LF hook context rendering in the daemon terminal model so lines like `Nodes`, `Edges`, and `Files` do not run together when the child emits newline-only separators.
+- 2026-05-15T08:27-0700 — Validation passed: `cargo fmt --all -- --check`, `/home/dberrios/.cargo/bin/cargo test -p argus-daemon -p argus-tui`, and `cargo clippy -p argus-daemon -p argus-tui --all-targets --all-features --locked -- -D warnings`.
+- 2026-05-15T08:32-0700 — Fixed scrollback-heavy TUI latency by capping render work to the visible pane and carrying a `styled_rows_start` anchor so snapshots style only the live viewport while preserving plain scrollback history.
+- 2026-05-15T08:32-0700 — Validation passed: `cargo fmt --all -- --check`, `/home/dberrios/.cargo/bin/cargo test -p argus-daemon -p argus-tui`, and `cargo clippy -p argus-core -p argus-daemon -p argus-tui --all-targets --all-features --locked -- -D warnings`.
+- 2026-05-15T08:46-0700 — Changed active terminal-pane selections so `Ctrl-C` copies through OSC 52 and consumes the key instead of sending interrupt input to the child session; without a selection, `Ctrl-C` still forwards normally.
+- 2026-05-15T08:48-0700 — Validation passed: `cargo fmt --all -- --check`, `/home/dberrios/.cargo/bin/cargo test -p argus-tui`, `/home/dberrios/.cargo/bin/cargo test -p argus-daemon`, `cargo clippy -p argus-core -p argus-daemon -p argus-tui --all-targets --all-features --locked -- -D warnings`, and `git diff --check`.
+- 2026-05-15T08:49-0700 — Fixed scrolled-back TUI views to keep the selected content anchored when later daemon snapshots append additional scrollback rows, while leaving bottom-following behavior unchanged.
+- 2026-05-15T08:50-0700 — Validation passed: `cargo fmt --all -- --check`, `/home/dberrios/.cargo/bin/cargo test -p argus-tui`, `/home/dberrios/.cargo/bin/cargo test -p argus-daemon`, `cargo clippy -p argus-core -p argus-daemon -p argus-tui --all-targets --all-features --locked -- -D warnings`, and `git diff --check`.

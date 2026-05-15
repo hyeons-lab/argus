@@ -102,6 +102,7 @@ pub struct SessionSnapshot {
     pub bytes_logged: u64,
     pub size: SessionSize,
     pub visible_rows: Vec<String>,
+    pub styled_rows_start: usize,
     pub styled_rows: Vec<StyledRow>,
     pub cursor: TerminalCursor,
     pub current_working_directory: Option<PathBuf>,

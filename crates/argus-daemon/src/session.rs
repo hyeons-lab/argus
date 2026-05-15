@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs;
 use std::fs::{File, OpenOptions};
@@ -503,6 +504,7 @@ struct OutputState {
     log: File,
     terminal: Terminal,
     cwd_sequence_buffer: Vec<u8>,
+    last_terminal_input_byte: Option<u8>,
     bytes_logged: u64,
     output_seq: u64,
 }
@@ -682,6 +684,7 @@ impl ActorState {
             bytes_logged: self.output.bytes_logged,
             size: self.size.clone(),
             visible_rows: visible_rows(&self.output.terminal),
+            styled_rows_start: styled_rows_start(&self.output.terminal),
             styled_rows: styled_visible_rows(&self.output.terminal),
             cursor: terminal_cursor(&self.output.terminal),
             current_working_directory: self.current_working_directory.clone(),
@@ -837,7 +840,10 @@ impl OutputState {
         self.bytes_logged += bytes.len() as u64;
         self.output_seq += 1;
         let current_working_directory = self.extract_current_working_directory(bytes);
-        self.terminal.advance_bytes(bytes);
+        let (terminal_bytes, last_terminal_input_byte) =
+            normalize_bare_line_feeds(bytes, self.last_terminal_input_byte);
+        self.last_terminal_input_byte = last_terminal_input_byte;
+        self.terminal.advance_bytes(&terminal_bytes);
         Ok(current_working_directory)
     }
 
@@ -927,6 +933,7 @@ fn spawn_pty_runtime(config: SessionConfig) -> Result<PtyRuntime> {
             log,
             terminal,
             cwd_sequence_buffer: Vec::new(),
+            last_terminal_input_byte: None,
             bytes_logged: 0,
             output_seq: 0,
         },
@@ -1040,6 +1047,37 @@ fn shared_pty_writer(writer: Box<dyn Write + Send>) -> SharedPtyWriter {
     Arc::new(Mutex::new(writer))
 }
 
+fn normalize_bare_line_feeds(
+    bytes: &[u8],
+    previous_byte: Option<u8>,
+) -> (Cow<'_, [u8]>, Option<u8>) {
+    let last_byte = bytes.last().copied().or(previous_byte);
+    if !bytes.iter().enumerate().any(|(index, byte)| {
+        *byte == b'\n'
+            && if index == 0 {
+                previous_byte != Some(b'\r')
+            } else {
+                bytes[index - 1] != b'\r'
+            }
+    }) {
+        return (Cow::Borrowed(bytes), last_byte);
+    }
+
+    let mut normalized = Vec::with_capacity(bytes.len());
+    for (index, byte) in bytes.iter().enumerate() {
+        let previous = if index == 0 {
+            previous_byte
+        } else {
+            Some(bytes[index - 1])
+        };
+        if *byte == b'\n' && previous != Some(b'\r') {
+            normalized.push(b'\r');
+        }
+        normalized.push(*byte);
+    }
+    (Cow::Owned(normalized), last_byte)
+}
+
 struct TerminalOutputSink {
     writer: SharedPtyWriter,
 }
@@ -1085,8 +1123,9 @@ fn visible_rows(terminal: &Terminal) -> Vec<String> {
 fn styled_visible_rows(terminal: &Terminal) -> Vec<StyledRow> {
     let screen = terminal.screen();
     let end = screen.scrollback_rows();
+    let start = styled_rows_start(terminal);
     let palette = ColorPalette::default();
-    let mut lines = screen.lines_in_phys_range(0..end);
+    let mut lines = screen.lines_in_phys_range(start..end);
 
     lines
         .iter_mut()
@@ -1115,6 +1154,13 @@ fn styled_visible_rows(terminal: &Terminal) -> Vec<StyledRow> {
             StyledRow { spans }
         })
         .collect()
+}
+
+fn styled_rows_start(terminal: &Terminal) -> usize {
+    let screen = terminal.screen();
+    screen
+        .scrollback_rows()
+        .saturating_sub(screen.physical_rows)
 }
 
 fn terminal_cursor(terminal: &Terminal) -> TerminalCursor {
@@ -1297,6 +1343,45 @@ mod tests {
         );
         assert!(rows.len() > output.terminal.screen().physical_rows);
         let _ = std::fs::remove_file(log_path);
+    }
+
+    #[test]
+    fn visible_rows_treat_bare_line_feeds_as_new_lines() {
+        let log_path = unique_log_path();
+        let mut output = test_output_state(
+            &log_path,
+            SessionSize {
+                rows: 4,
+                cols: 32,
+                pixel_width: 320,
+                pixel_height: 80,
+                dpi: 96,
+            },
+        );
+
+        output
+            .ingest(b"Nodes: 330\nEdges: 2400\nFiles: 8")
+            .expect("ingest bare line feeds");
+        let rows = visible_rows(&output.terminal);
+
+        assert!(rows.iter().any(|row| row == "Nodes: 330"));
+        assert!(rows.iter().any(|row| row == "Edges: 2400"));
+        assert!(rows.iter().any(|row| row == "Files: 8"));
+        let _ = std::fs::remove_file(log_path);
+    }
+
+    #[test]
+    fn bare_line_feed_normalization_handles_split_crlf() {
+        assert_eq!(
+            normalize_bare_line_feeds(b"\nFiles", Some(b'\r'))
+                .0
+                .as_ref(),
+            b"\nFiles"
+        );
+        assert_eq!(
+            normalize_bare_line_feeds(b"\nFiles", None).0.as_ref(),
+            b"\r\nFiles"
+        );
     }
 
     #[test]
@@ -1837,6 +1922,7 @@ mod tests {
                 Box::new(TerminalOutputSink { writer }),
             ),
             cwd_sequence_buffer: Vec::new(),
+            last_terminal_input_byte: None,
             bytes_logged: 0,
             output_seq: 0,
         }

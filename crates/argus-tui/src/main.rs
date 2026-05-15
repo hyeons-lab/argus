@@ -10,7 +10,7 @@ use argus_core::session::{
 use argus_tui::{LocalSessionApp, SessionView, session_size_from_terminal};
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers, MouseEventKind,
+    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -157,11 +157,12 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut LocalSession
     let mut sidebar_visible = true;
     let mut pending_confirmation = None;
     let mut terminal_area = Rect::default();
+    let mut selection = None;
 
     loop {
         app.drain_events();
         terminal.draw(|frame| {
-            terminal_area = draw(frame, app, sidebar_visible, pending_confirmation);
+            terminal_area = draw(frame, app, sidebar_visible, pending_confirmation, selection);
         })?;
 
         if !event::poll(Duration::from_millis(50))? {
@@ -183,6 +184,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut LocalSession
             Event::Key(key) => match key_to_command(key) {
                 Some(AppCommand::New) => {
                     pending_confirmation = None;
+                    selection = None;
                     app.create_session(current_session_size(sidebar_visible)?);
                 }
                 Some(AppCommand::Close) => {
@@ -191,31 +193,47 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut LocalSession
                         continue;
                     }
                     pending_confirmation = None;
+                    selection = None;
                     app.close_selected_session();
                 }
                 Some(AppCommand::Next) => {
                     pending_confirmation = None;
+                    selection = None;
                     app.select_next_session();
                 }
                 Some(AppCommand::Previous) => {
                     pending_confirmation = None;
+                    selection = None;
                     app.select_previous_session();
                 }
                 Some(AppCommand::ToggleSidebar) => {
                     pending_confirmation = None;
+                    selection = None;
                     sidebar_visible = !sidebar_visible;
                     app.resize(current_session_size(sidebar_visible)?);
                 }
                 Some(AppCommand::ScrollUp) => {
                     pending_confirmation = None;
+                    selection = None;
                     app.scroll_selected(terminal_page_scroll_lines(terminal_area));
                 }
                 Some(AppCommand::ScrollDown) => {
                     pending_confirmation = None;
+                    selection = None;
                     app.scroll_selected(-terminal_page_scroll_lines(terminal_area));
                 }
                 None => {
                     pending_confirmation = None;
+                    if copy_selection_on_control_c(
+                        key,
+                        app.view(),
+                        terminal_area,
+                        &mut selection,
+                        terminal.backend_mut(),
+                    )? {
+                        continue;
+                    }
+                    selection = None;
                     if let Some(bytes) = key_to_input(key) {
                         app.write_input(bytes);
                     }
@@ -223,19 +241,20 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut LocalSession
             },
             Event::Resize(cols, rows) => {
                 pending_confirmation = None;
+                selection = None;
                 app.resize(session_size_from_app_terminal(rows, cols, sidebar_visible));
             }
-            Event::Mouse(mouse) => match mouse.kind {
-                MouseEventKind::ScrollUp => {
+            Event::Mouse(mouse) => {
+                if handle_mouse_event(
+                    mouse,
+                    terminal_area,
+                    app,
+                    &mut selection,
+                    terminal.backend_mut(),
+                )? {
                     pending_confirmation = None;
-                    app.scroll_selected(3);
                 }
-                MouseEventKind::ScrollDown => {
-                    pending_confirmation = None;
-                    app.scroll_selected(-3);
-                }
-                _ => {}
-            },
+            }
             _ => {}
         }
     }
@@ -246,6 +265,7 @@ fn draw(
     app: &LocalSessionApp,
     sidebar_visible: bool,
     pending_confirmation: Option<Confirmation>,
+    selection: Option<TerminalSelection>,
 ) -> Rect {
     let root = Layout::default()
         .direction(Direction::Vertical)
@@ -258,10 +278,10 @@ fn draw(
             .constraints([Constraint::Length(28), Constraint::Min(20)])
             .split(root[0]);
         draw_sidebar(frame, body[0], app);
-        draw_terminal(frame, body[1], app.view());
+        draw_terminal(frame, body[1], app.view(), selection);
         body[1]
     } else {
-        draw_terminal(frame, root[0], app.view());
+        draw_terminal(frame, root[0], app.view(), selection);
         root[0]
     };
 
@@ -327,7 +347,12 @@ fn session_sidebar_rows(index: usize, selected: usize, view: &SessionView) -> Ve
     ]
 }
 
-fn draw_terminal(frame: &mut ratatui::Frame<'_>, area: Rect, view: &SessionView) {
+fn draw_terminal(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    view: &SessionView,
+    selection: Option<TerminalSelection>,
+) {
     let visible_height = usize::from(area.height);
     let start = view
         .snapshot
@@ -335,11 +360,22 @@ fn draw_terminal(frame: &mut ratatui::Frame<'_>, area: Rect, view: &SessionView)
         .len()
         .saturating_sub(visible_height)
         .saturating_sub(view.scroll_offset);
+    let end = start
+        .saturating_add(visible_height)
+        .min(view.snapshot.visible_rows.len());
     let render_cols = terminal_render_cols(area, view.snapshot.size.cols);
-    let rows = if view.snapshot.styled_rows.len() == view.snapshot.visible_rows.len() {
-        styled_rows_to_lines(&view.snapshot.styled_rows[start..], render_cols)
+    let selection = selection.map(|selection| selection.to_visible_range(start));
+    let rows = if let Some(selection) = selection {
+        selected_rows_to_lines(
+            &view.snapshot.visible_rows[start..end],
+            render_cols,
+            start,
+            selection,
+        )
+    } else if let Some(styled_rows) = styled_rows_for_visible_range(&view.snapshot, start, end) {
+        styled_rows_to_lines(styled_rows, render_cols)
     } else {
-        view.snapshot.visible_rows[start..]
+        view.snapshot.visible_rows[start..end]
             .iter()
             .map(|row| Line::from(row.as_str()))
             .collect::<Vec<_>>()
@@ -379,6 +415,335 @@ fn terminal_cursor_position(
 
 fn terminal_page_scroll_lines(area: Rect) -> isize {
     isize::try_from(area.height.saturating_sub(1).max(1)).unwrap_or(1)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TerminalSelection {
+    start: TerminalPoint,
+    end: TerminalPoint,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TerminalPoint {
+    col: usize,
+    row: usize,
+}
+
+impl TerminalSelection {
+    fn new(point: TerminalPoint) -> Self {
+        Self {
+            start: point,
+            end: point,
+        }
+    }
+
+    fn update(&mut self, point: TerminalPoint) {
+        self.end = point;
+    }
+
+    fn to_visible_range(self, first_visible_row: usize) -> VisibleSelection {
+        let (start, end) = ordered_terminal_points(self.start, self.end);
+        VisibleSelection {
+            start: TerminalPoint {
+                col: start.col,
+                row: first_visible_row + start.row,
+            },
+            end: TerminalPoint {
+                col: end.col,
+                row: first_visible_row + end.row,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VisibleSelection {
+    start: TerminalPoint,
+    end: TerminalPoint,
+}
+
+fn handle_mouse_event(
+    mouse: MouseEvent,
+    terminal_area: Rect,
+    app: &mut LocalSessionApp,
+    selection: &mut Option<TerminalSelection>,
+    output: &mut CrosstermBackend<Stdout>,
+) -> Result<bool> {
+    match mouse.kind {
+        MouseEventKind::ScrollUp
+            if terminal_area_contains(terminal_area, mouse.column, mouse.row) =>
+        {
+            *selection = None;
+            app.scroll_selected(3);
+            Ok(true)
+        }
+        MouseEventKind::ScrollDown
+            if terminal_area_contains(terminal_area, mouse.column, mouse.row) =>
+        {
+            *selection = None;
+            app.scroll_selected(-3);
+            Ok(true)
+        }
+        MouseEventKind::Down(MouseButton::Left) => {
+            if !terminal_area_contains(terminal_area, mouse.column, mouse.row) {
+                return Ok(false);
+            }
+            let Some(point) = terminal_point_from_mouse(terminal_area, mouse) else {
+                return Ok(false);
+            };
+            *selection = Some(TerminalSelection::new(point));
+            Ok(true)
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            if selection.is_none()
+                && !terminal_area_contains(terminal_area, mouse.column, mouse.row)
+            {
+                return Ok(false);
+            }
+            let Some(point) = terminal_point_from_mouse(terminal_area, mouse) else {
+                return Ok(false);
+            };
+            if let Some(selection) = selection {
+                selection.update(point);
+            } else {
+                *selection = Some(TerminalSelection::new(point));
+            }
+            Ok(true)
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            let Some(mut selected) = *selection else {
+                return Ok(false);
+            };
+            if let Some(point) = terminal_point_from_mouse(terminal_area, mouse) {
+                selected.update(point);
+                *selection = Some(selected);
+            }
+            let text = selected_text(app.view(), terminal_area, selected);
+            if !text.trim().is_empty() {
+                write_osc52_clipboard(output, &text)?;
+            }
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+fn terminal_area_contains(area: Rect, col: u16, row: u16) -> bool {
+    col >= area.x
+        && row >= area.y
+        && col < area.x.saturating_add(area.width)
+        && row < area.y.saturating_add(area.height)
+}
+
+fn terminal_point_from_mouse(area: Rect, mouse: MouseEvent) -> Option<TerminalPoint> {
+    if area.width == 0 || area.height == 0 {
+        return None;
+    }
+
+    let max_col = area.x.saturating_add(area.width.saturating_sub(1));
+    let max_row = area.y.saturating_add(area.height.saturating_sub(1));
+    let col = mouse.column.clamp(area.x, max_col).saturating_sub(area.x);
+    let row = mouse.row.clamp(area.y, max_row).saturating_sub(area.y);
+
+    Some(TerminalPoint {
+        col: usize::from(col),
+        row: usize::from(row),
+    })
+}
+
+fn selected_text(view: &SessionView, area: Rect, selection: TerminalSelection) -> String {
+    let visible_height = usize::from(area.height);
+    let first_visible_row = view
+        .snapshot
+        .visible_rows
+        .len()
+        .saturating_sub(visible_height)
+        .saturating_sub(view.scroll_offset);
+    let selection = selection.to_visible_range(first_visible_row);
+
+    view.snapshot
+        .visible_rows
+        .iter()
+        .enumerate()
+        .skip(selection.start.row)
+        .take(selection.end.row.saturating_sub(selection.start.row) + 1)
+        .filter_map(|(row_index, row)| {
+            selected_row_text(row, row_index, selection).map(|line| line.trim_end().to_string())
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn copy_selection_on_control_c(
+    key: KeyEvent,
+    view: &SessionView,
+    area: Rect,
+    selection: &mut Option<TerminalSelection>,
+    output: &mut CrosstermBackend<Stdout>,
+) -> Result<bool> {
+    if !is_control_c(key) {
+        return Ok(false);
+    }
+
+    let Some(selected) = *selection else {
+        return Ok(false);
+    };
+
+    let text = selected_text(view, area, selected);
+    if !text.trim().is_empty() {
+        write_osc52_clipboard(output, &text)?;
+    }
+    *selection = None;
+    Ok(true)
+}
+
+fn styled_rows_for_visible_range(
+    snapshot: &argus_core::session::SessionSnapshot,
+    start: usize,
+    end: usize,
+) -> Option<&[StyledRow]> {
+    let styled_start = snapshot.styled_rows_start;
+    let styled_end = styled_start.checked_add(snapshot.styled_rows.len())?;
+    if start < styled_start || end > styled_end {
+        return None;
+    }
+
+    Some(&snapshot.styled_rows[start - styled_start..end - styled_start])
+}
+
+fn selected_rows_to_lines(
+    rows: &[String],
+    cols: usize,
+    first_visible_row: usize,
+    selection: VisibleSelection,
+) -> Vec<Line<'static>> {
+    rows.iter()
+        .enumerate()
+        .map(|(index, row)| {
+            let visible_row_index = first_visible_row + index;
+            selected_row_to_line(row, cols, visible_row_index, selection)
+        })
+        .collect()
+}
+
+fn selected_row_to_line(
+    row: &str,
+    cols: usize,
+    row_index: usize,
+    selection: VisibleSelection,
+) -> Line<'static> {
+    let Some((start, end)) = selected_row_bounds(row, row_index, selection) else {
+        return Line::from(row.to_string());
+    };
+
+    let padded = pad_to_cols(row, cols);
+    let before = slice_chars(&padded, 0, start);
+    let selected = slice_chars(&padded, start, end);
+    let after = slice_chars(&padded, end, padded.chars().count());
+    Line::from(vec![
+        Span::raw(before),
+        Span::styled(selected, Style::default().add_modifier(Modifier::REVERSED)),
+        Span::raw(after),
+    ])
+}
+
+fn selected_row_text(row: &str, row_index: usize, selection: VisibleSelection) -> Option<String> {
+    let (start, end) = selected_row_bounds(row, row_index, selection)?;
+    Some(slice_chars(row, start, end.min(row.chars().count())))
+}
+
+fn selected_row_bounds(
+    row: &str,
+    row_index: usize,
+    selection: VisibleSelection,
+) -> Option<(usize, usize)> {
+    if row_index < selection.start.row || row_index > selection.end.row {
+        return None;
+    }
+
+    let row_len = row.chars().count();
+    let end_of_row = row_len.max(selection.end.col.saturating_add(1));
+    let start = if row_index == selection.start.row {
+        selection.start.col
+    } else {
+        0
+    };
+    let end = if row_index == selection.end.row {
+        selection.end.col.saturating_add(1)
+    } else {
+        end_of_row
+    };
+
+    if start >= end {
+        None
+    } else {
+        Some((start, end))
+    }
+}
+
+fn ordered_terminal_points(
+    start: TerminalPoint,
+    end: TerminalPoint,
+) -> (TerminalPoint, TerminalPoint) {
+    if (end.row, end.col) < (start.row, start.col) {
+        (end, start)
+    } else {
+        (start, end)
+    }
+}
+
+fn pad_to_cols(row: &str, cols: usize) -> String {
+    let width = row.chars().count();
+    if width >= cols {
+        row.to_string()
+    } else {
+        format!("{row}{}", " ".repeat(cols - width))
+    }
+}
+
+fn slice_chars(value: &str, start: usize, end: usize) -> String {
+    value
+        .chars()
+        .skip(start)
+        .take(end.saturating_sub(start))
+        .collect()
+}
+
+fn write_osc52_clipboard(output: &mut CrosstermBackend<Stdout>, text: &str) -> Result<()> {
+    use std::io::Write;
+
+    write!(output, "\x1b]52;c;{}\x07", base64_encode(text.as_bytes()))
+        .context("writing terminal clipboard selection")?;
+    output
+        .flush()
+        .context("flushing terminal clipboard selection")
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut output = String::with_capacity(bytes.len().div_ceil(3) * 4);
+
+    for chunk in bytes.chunks(3) {
+        let first = chunk[0];
+        let second = *chunk.get(1).unwrap_or(&0);
+        let third = *chunk.get(2).unwrap_or(&0);
+        let value = ((first as u32) << 16) | ((second as u32) << 8) | third as u32;
+
+        output.push(ALPHABET[((value >> 18) & 0x3f) as usize] as char);
+        output.push(ALPHABET[((value >> 12) & 0x3f) as usize] as char);
+        if chunk.len() > 1 {
+            output.push(ALPHABET[((value >> 6) & 0x3f) as usize] as char);
+        } else {
+            output.push('=');
+        }
+        if chunk.len() > 2 {
+            output.push(ALPHABET[(value & 0x3f) as usize] as char);
+        } else {
+            output.push('=');
+        }
+    }
+
+    output
 }
 
 fn styled_rows_to_lines(rows: &[StyledRow], cols: usize) -> Vec<Line<'static>> {
@@ -537,6 +902,11 @@ fn should_exit(key: KeyEvent) -> bool {
         && matches!(key.code, KeyCode::Char('q') | KeyCode::Char('Q'))
 }
 
+fn is_control_c(key: KeyEvent) -> bool {
+    key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
+}
+
 fn key_to_input(key: KeyEvent) -> Option<Vec<u8>> {
     match key.code {
         KeyCode::Char(character) if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -665,6 +1035,22 @@ mod tests {
     }
 
     #[test]
+    fn control_c_is_detected_for_selection_copy() {
+        assert!(is_control_c(KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+        )));
+        assert!(is_control_c(KeyEvent::new(
+            KeyCode::Char('C'),
+            KeyModifiers::CONTROL,
+        )));
+        assert!(!is_control_c(KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::NONE,
+        )));
+    }
+
+    #[test]
     fn reserved_control_keys_become_app_commands() {
         assert_eq!(
             key_to_command(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL)),
@@ -714,6 +1100,75 @@ mod tests {
 
         assert_eq!(size.rows, 23);
         assert_eq!(size.cols, 100);
+    }
+
+    #[test]
+    fn terminal_selection_extracts_only_visible_terminal_text() {
+        let view = SessionView {
+            session_id: argus_core::session::SessionId::new("session-1").expect("session id"),
+            snapshot: argus_core::session::SessionSnapshot {
+                output_seq: 0,
+                bytes_logged: 0,
+                size: SessionSize::default(),
+                visible_rows: vec![
+                    "ignored".to_string(),
+                    "alpha beta".to_string(),
+                    "gamma delta".to_string(),
+                ],
+                styled_rows_start: 0,
+                styled_rows: Vec::new(),
+                cursor: argus_core::session::TerminalCursor {
+                    row: 0,
+                    col: 0,
+                    visible: false,
+                },
+                current_working_directory: None,
+                exited: false,
+            },
+            lease: argus_core::session::InputLeaseState::default(),
+            last_completed: None,
+            scroll_offset: 0,
+        };
+        let area = Rect {
+            x: 28,
+            y: 0,
+            width: 20,
+            height: 2,
+        };
+        let selection = TerminalSelection {
+            start: TerminalPoint { col: 2, row: 0 },
+            end: TerminalPoint { col: 4, row: 1 },
+        };
+
+        assert_eq!(selected_text(&view, area, selection), "pha beta\ngamma");
+    }
+
+    #[test]
+    fn terminal_point_clamps_to_terminal_pane() {
+        let area = Rect {
+            x: 28,
+            y: 1,
+            width: 10,
+            height: 4,
+        };
+        let point = terminal_point_from_mouse(
+            area,
+            MouseEvent {
+                kind: MouseEventKind::Drag(MouseButton::Left),
+                column: 3,
+                row: 99,
+                modifiers: KeyModifiers::NONE,
+            },
+        )
+        .expect("terminal point");
+
+        assert_eq!(point, TerminalPoint { col: 0, row: 3 });
+    }
+
+    #[test]
+    fn base64_encoder_pads_terminal_clipboard_payloads() {
+        assert_eq!(base64_encode(b"Argus"), "QXJndXM=");
+        assert_eq!(base64_encode(b"copy"), "Y29weQ==");
     }
 
     #[test]
@@ -779,6 +1234,45 @@ mod tests {
         assert_eq!(lines[0].spans[0].content.as_ref(), "top");
         assert!(lines[1].spans.is_empty());
         assert_eq!(lines[2].spans[0].content.as_ref(), "bottom");
+    }
+
+    #[test]
+    fn styled_rows_are_selected_by_snapshot_anchor() {
+        let snapshot = argus_core::session::SessionSnapshot {
+            output_seq: 0,
+            bytes_logged: 0,
+            size: SessionSize::default(),
+            visible_rows: vec![
+                "history".to_string(),
+                "visible-1".to_string(),
+                "visible-2".to_string(),
+            ],
+            styled_rows_start: 1,
+            styled_rows: vec![
+                StyledRow {
+                    spans: vec![StyledSpan {
+                        text: "visible-1".to_string(),
+                        style: TerminalStyle::default(),
+                    }],
+                },
+                StyledRow {
+                    spans: vec![StyledSpan {
+                        text: "visible-2".to_string(),
+                        style: TerminalStyle::default(),
+                    }],
+                },
+            ],
+            cursor: TerminalCursor {
+                row: 2,
+                col: 0,
+                visible: true,
+            },
+            current_working_directory: None,
+            exited: false,
+        };
+
+        assert!(styled_rows_for_visible_range(&snapshot, 1, 3).is_some());
+        assert!(styled_rows_for_visible_range(&snapshot, 0, 2).is_none());
     }
 
     #[test]

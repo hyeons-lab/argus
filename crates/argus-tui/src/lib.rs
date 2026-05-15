@@ -212,7 +212,7 @@ impl LocalSessionApp {
             if refresh_snapshot && !session.view.snapshot.exited {
                 let session_id = session.view.session_id.clone();
                 match self.manager.snapshot_session(session_id) {
-                    Ok(snapshot) => session.view.snapshot = snapshot,
+                    Ok(snapshot) => replace_snapshot_preserving_scroll(&mut session.view, snapshot),
                     Err(error) => {
                         self.last_error = Some(format!(
                             "refreshing session snapshot after output events: {error}"
@@ -420,7 +420,7 @@ pub fn apply_event_to_view(view: &mut SessionView, event: SessionEvent) -> bool 
             session_id,
             snapshot,
         } if session_id == view.session_id => {
-            view.snapshot = snapshot;
+            replace_snapshot_preserving_scroll(view, snapshot);
             false
         }
         SessionEvent::LeaseChanged { session_id, change } if session_id == view.session_id => {
@@ -437,6 +437,7 @@ pub fn apply_event_to_view(view: &mut SessionView, event: SessionEvent) -> bool 
             view.snapshot.output_seq = completed.output_seq;
             view.snapshot.bytes_logged = completed.bytes_logged;
             view.snapshot.visible_rows = completed.visible_rows.clone();
+            view.snapshot.styled_rows_start = 0;
             view.snapshot.styled_rows.clear();
             view.snapshot.exited = true;
             view.last_completed = Some(completed);
@@ -444,6 +445,18 @@ pub fn apply_event_to_view(view: &mut SessionView, event: SessionEvent) -> bool 
         }
         _ => false,
     }
+}
+
+fn replace_snapshot_preserving_scroll(view: &mut SessionView, snapshot: SessionSnapshot) {
+    if view.scroll_offset > 0 {
+        let previous_rows = view.snapshot.visible_rows.len();
+        let next_rows = snapshot.visible_rows.len();
+        view.scroll_offset = view
+            .scroll_offset
+            .saturating_add(next_rows.saturating_sub(previous_rows))
+            .min(next_rows.saturating_sub(1));
+    }
+    view.snapshot = snapshot;
 }
 
 pub fn session_size_from_terminal(rows: u16, cols: u16) -> SessionSize {
@@ -579,6 +592,55 @@ mod tests {
                 snapshot,
             },
         ));
+    }
+
+    #[test]
+    fn snapshot_events_keep_scrolled_back_content_anchored() {
+        let session_id = SessionId::new("session-1").expect("session id");
+        let mut view = test_view(session_id.clone());
+        view.snapshot.visible_rows = vec!["a".into(), "b".into(), "c".into(), "d".into()];
+        view.scroll_offset = 2;
+
+        let mut snapshot = view.snapshot.clone();
+        snapshot.visible_rows = vec![
+            "a".into(),
+            "b".into(),
+            "c".into(),
+            "d".into(),
+            "e".into(),
+            "f".into(),
+        ];
+
+        apply_event_to_view(
+            &mut view,
+            SessionEvent::Snapshot {
+                session_id,
+                snapshot,
+            },
+        );
+
+        assert_eq!(view.scroll_offset, 4);
+    }
+
+    #[test]
+    fn snapshot_events_keep_bottom_following_when_not_scrolled_back() {
+        let session_id = SessionId::new("session-1").expect("session id");
+        let mut view = test_view(session_id.clone());
+        view.snapshot.visible_rows = vec!["a".into(), "b".into()];
+        view.scroll_offset = 0;
+
+        let mut snapshot = view.snapshot.clone();
+        snapshot.visible_rows = vec!["a".into(), "b".into(), "c".into()];
+
+        apply_event_to_view(
+            &mut view,
+            SessionEvent::Snapshot {
+                session_id,
+                snapshot,
+            },
+        );
+
+        assert_eq!(view.scroll_offset, 0);
     }
 
     #[test]
@@ -792,6 +854,7 @@ mod tests {
                 bytes_logged: 0,
                 size: SessionSize::default(),
                 visible_rows: Vec::new(),
+                styled_rows_start: 0,
                 styled_rows: Vec::new(),
                 cursor: TerminalCursor {
                     row: 0,
@@ -845,6 +908,7 @@ mod tests {
                     bytes_logged: 0,
                     size: SessionSize::default(),
                     visible_rows: Vec::new(),
+                    styled_rows_start: 0,
                     styled_rows: Vec::new(),
                     cursor: TerminalCursor {
                         row: 0,

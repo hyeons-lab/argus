@@ -239,12 +239,24 @@ fn start_local_session(
     request.size = size;
 
     let session_id = manager.start_session(request)?;
-    let events = manager.subscribe_session_events(session_id.clone())?;
-    let attached = manager.attach_session(AttachSessionRequest {
+    let events = match manager.subscribe_session_events(session_id.clone()) {
+        Ok(events) => events,
+        Err(error) => {
+            let _ = manager.shutdown_session(session_id);
+            return Err(error);
+        }
+    };
+    let attached = match manager.attach_session(AttachSessionRequest {
         session_id: session_id.clone(),
         client_id: client_id.clone(),
         mode: AttachMode::InteractiveController,
-    })?;
+    }) {
+        Ok(attached) => attached,
+        Err(error) => {
+            let _ = manager.shutdown_session(session_id);
+            return Err(error);
+        }
+    };
 
     Ok(SessionRuntime {
         events,

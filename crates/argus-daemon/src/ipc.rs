@@ -545,10 +545,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
 
-        let saw_output_event = events
-            .try_iter()
-            .any(|event| matches!(event, SessionEvent::Output { .. }));
-        assert!(saw_output_event);
+        wait_for_output_event(&events);
         client
             .shutdown_session(session_id)
             .expect("shutdown session");
@@ -590,5 +587,21 @@ mod tests {
             std::process::id(),
             std::thread::current().id()
         ))
+    }
+
+    fn wait_for_output_event(events: &SessionEventReceiver) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(!remaining.is_zero(), "timed out waiting for output event");
+            match events.recv_timeout(remaining.min(Duration::from_millis(100))) {
+                Ok(SessionEvent::Output { .. }) => return,
+                Ok(_) => {}
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    panic!("event stream closed while waiting for output event");
+                }
+            }
+        }
     }
 }

@@ -25,9 +25,11 @@
 - Updated the TUI binary to prefer the daemon socket path and keep the current embedded behavior as fallback.
 - Added socket transport coverage for server error propagation and a real PTY lifecycle with event streaming.
 - Addressed PR feedback on accept-loop resilience, idle subscription cleanup, and temp fallback socket scoping.
+- Cleaned up daemon-created TUI sessions when startup fails after `start_session`, and made the IPC event-stream assertion wait deterministically instead of racing the reader thread.
 
 ## Commits
-- HEAD — feat: add local Unix socket session API
+- 52a1148 — feat: add local Unix socket session API
+- HEAD — fix: clean up TUI daemon startup failures
 
 ## Progress
 - 2026-05-14T10:00-0700 — Created `feat/local-unix-socket-api` worktree from `origin/main` and unset the accidental upstream.
@@ -36,6 +38,7 @@
 - 2026-05-14T10:28-0700 — Smoke tested `argus-daemon` and `argus-tui` together with temp runtime/state directories; the first sandboxed TUI run fell back to the embedded manager, then the unsandboxed TUI run connected to the daemon socket and produced a daemon-owned session log at `<tmp>/argus/sessions/session-1.log`.
 - 2026-05-14T16:23-0700 — Addressed Copilot PR comments for resilient accept handling, idle subscriber cleanup, and user-scoped temp socket fallback.
 - 2026-05-14T16:23-0700 — Validation passed after review fixes: `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo check --workspace`, `/home/dberrios/.cargo/bin/cargo test --workspace`, and `git diff --check`.
+- 2026-05-14T17:02-0700 — Fixed critical-review follow-ups for partial TUI daemon startup cleanup and the racy IPC output-event assertion.
 
 ## Next Steps
 - Decide whether the next slice should make the TUI require the daemon socket or keep embedded fallback as an explicit development mode.

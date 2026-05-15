@@ -24,6 +24,7 @@ use wezterm_term::color::{ColorAttribute, ColorPalette, SrgbaTuple};
 use wezterm_term::{Terminal, TerminalConfiguration, TerminalSize};
 
 const EVENT_SUBSCRIBER_BUFFER: usize = 64;
+const MAX_OSC_BUFFER: usize = 4096;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionConfig {
@@ -849,7 +850,9 @@ impl OutputState {
                 self.cwd_sequence_buffer.drain(..start);
             }
 
-            let terminator = find_osc_terminator(&self.cwd_sequence_buffer)?;
+            let Some(terminator) = find_osc_terminator(&self.cwd_sequence_buffer) else {
+                break;
+            };
             let payload = &self.cwd_sequence_buffer[b"\x1b]7;file://".len()..terminator];
             if let Some(path) = cwd_from_osc7_payload(payload) {
                 current_working_directory = Some(path);
@@ -863,7 +866,6 @@ impl OutputState {
             self.cwd_sequence_buffer.drain(..drain_to);
         }
 
-        const MAX_OSC_BUFFER: usize = 4096;
         if self.cwd_sequence_buffer.len() > MAX_OSC_BUFFER {
             let keep_from = self.cwd_sequence_buffer.len() - MAX_OSC_BUFFER;
             self.cwd_sequence_buffer.drain(..keep_from);
@@ -1072,10 +1074,9 @@ fn is_closed_pty_error(_: &std::io::Error) -> bool {
 fn visible_rows(terminal: &Terminal) -> Vec<String> {
     let screen = terminal.screen();
     let end = screen.scrollback_rows();
-    let start = end.saturating_sub(screen.physical_rows);
 
     screen
-        .lines_in_phys_range(start..end)
+        .lines_in_phys_range(0..end)
         .iter()
         .map(|line| line.as_str().trim_end().to_owned())
         .collect()
@@ -1084,9 +1085,8 @@ fn visible_rows(terminal: &Terminal) -> Vec<String> {
 fn styled_visible_rows(terminal: &Terminal) -> Vec<StyledRow> {
     let screen = terminal.screen();
     let end = screen.scrollback_rows();
-    let start = end.saturating_sub(screen.physical_rows);
     let palette = ColorPalette::default();
-    let mut lines = screen.lines_in_phys_range(start..end);
+    let mut lines = screen.lines_in_phys_range(0..end);
 
     lines
         .iter_mut()
@@ -1118,9 +1118,13 @@ fn styled_visible_rows(terminal: &Terminal) -> Vec<StyledRow> {
 }
 
 fn terminal_cursor(terminal: &Terminal) -> TerminalCursor {
+    let screen = terminal.screen();
     let cursor = terminal.cursor_pos();
     TerminalCursor {
-        row: cursor.y.max(0) as usize,
+        row: screen
+            .scrollback_rows()
+            .saturating_sub(screen.physical_rows)
+            + cursor.y.max(0) as usize,
         col: cursor.x,
         visible: format!("{:?}", cursor.visibility) == "Visible",
     }
@@ -1131,6 +1135,7 @@ fn terminal_style(attrs: &wezterm_term::CellAttributes, palette: &ColorPalette) 
         foreground: terminal_color(attrs.foreground(), palette, true),
         background: terminal_color(attrs.background(), palette, false),
         bold: format!("{:?}", attrs.intensity()) == "Bold",
+        dim: format!("{:?}", attrs.intensity()) == "Half",
         italic: attrs.italic(),
         underline: format!("{:?}", attrs.underline()) != "None",
         reverse: attrs.reverse(),
@@ -1210,6 +1215,22 @@ mod tests {
     }
 
     #[test]
+    fn output_state_bounds_unterminated_osc7_working_directory() {
+        let log_path = unique_log_path();
+        let mut output = test_output_state(&log_path, SessionSize::default());
+
+        output
+            .ingest(b"\x1b]7;file://host/")
+            .expect("ingest partial OSC 7");
+        output
+            .ingest(&vec![b'a'; MAX_OSC_BUFFER * 2])
+            .expect("ingest unterminated OSC 7 payload");
+
+        assert!(output.cwd_sequence_buffer.len() <= MAX_OSC_BUFFER);
+        let _ = std::fs::remove_file(log_path);
+    }
+
+    #[test]
     fn styled_rows_preserve_foreground_color() {
         let log_path = unique_log_path();
         let mut output = test_output_state(&log_path, SessionSize::default());
@@ -1225,6 +1246,87 @@ mod tests {
             .expect("red span");
 
         assert!(red_span.style.foreground.is_some());
+        let _ = std::fs::remove_file(log_path);
+    }
+
+    #[test]
+    fn styled_rows_preserve_dim_intensity() {
+        let log_path = unique_log_path();
+        let mut output = test_output_state(&log_path, SessionSize::default());
+
+        output
+            .ingest(b"\x1b[2mhint\x1b[0m")
+            .expect("ingest dim output");
+        let rows = styled_visible_rows(&output.terminal);
+        let dim_span = rows
+            .iter()
+            .flat_map(|row| &row.spans)
+            .find(|span| span.text.contains("hint"))
+            .expect("dim span");
+
+        assert!(dim_span.style.dim);
+        let _ = std::fs::remove_file(log_path);
+    }
+
+    #[test]
+    fn visible_rows_include_retained_scrollback() {
+        let log_path = unique_log_path();
+        let mut output = test_output_state(
+            &log_path,
+            SessionSize {
+                rows: 3,
+                cols: 24,
+                pixel_width: 240,
+                pixel_height: 60,
+                dpi: 96,
+            },
+        );
+
+        output
+            .ingest(b"line-1\r\nline-2\r\nline-3\r\nline-4\r\nline-5")
+            .expect("ingest scrollback output");
+        let rows = visible_rows(&output.terminal);
+
+        assert!(
+            rows.iter().any(|row| row.contains("line-1")),
+            "scrollback rows should include line-1: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|row| row.contains("line-5")),
+            "scrollback rows should include line-5: {rows:?}"
+        );
+        assert!(rows.len() > output.terminal.screen().physical_rows);
+        let _ = std::fs::remove_file(log_path);
+    }
+
+    #[test]
+    fn terminal_cursor_uses_scrollback_row_coordinates() {
+        let log_path = unique_log_path();
+        let mut output = test_output_state(
+            &log_path,
+            SessionSize {
+                rows: 3,
+                cols: 24,
+                pixel_width: 240,
+                pixel_height: 60,
+                dpi: 96,
+            },
+        );
+
+        output
+            .ingest(b"line-1\r\nline-2\r\nline-3\r\nline-4\r\nline-5")
+            .expect("ingest scrollback output");
+        let cursor = terminal_cursor(&output.terminal);
+
+        assert!(
+            cursor.row
+                >= output
+                    .terminal
+                    .screen()
+                    .scrollback_rows()
+                    .saturating_sub(output.terminal.screen().physical_rows),
+            "cursor should be positioned within the scrollback-backed row list: {cursor:?}"
+        );
         let _ = std::fs::remove_file(log_path);
     }
 

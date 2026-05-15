@@ -131,6 +131,7 @@ pub struct TerminalStyle {
     pub foreground: Option<TerminalColor>,
     pub background: Option<TerminalColor>,
     pub bold: bool,
+    pub dim: bool,
     pub italic: bool,
     pub underline: bool,
     pub reverse: bool,

@@ -8,7 +8,10 @@ use argus_core::session::{
     InputControllerKind, SessionSize, StyledRow, TerminalColor, TerminalCursor, TerminalStyle,
 };
 use argus_tui::{LocalSessionApp, SessionView, session_size_from_terminal};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, MouseEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -153,10 +156,13 @@ fn display_os_str(value: &OsStr) -> String {
 fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut LocalSessionApp) -> Result<()> {
     let mut sidebar_visible = true;
     let mut pending_confirmation = None;
+    let mut terminal_area = Rect::default();
 
     loop {
         app.drain_events();
-        terminal.draw(|frame| draw(frame, app, sidebar_visible, pending_confirmation))?;
+        terminal.draw(|frame| {
+            terminal_area = draw(frame, app, sidebar_visible, pending_confirmation);
+        })?;
 
         if !event::poll(Duration::from_millis(50))? {
             continue;
@@ -200,6 +206,14 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut LocalSession
                     sidebar_visible = !sidebar_visible;
                     app.resize(current_session_size(sidebar_visible)?);
                 }
+                Some(AppCommand::ScrollUp) => {
+                    pending_confirmation = None;
+                    app.scroll_selected(terminal_page_scroll_lines(terminal_area));
+                }
+                Some(AppCommand::ScrollDown) => {
+                    pending_confirmation = None;
+                    app.scroll_selected(-terminal_page_scroll_lines(terminal_area));
+                }
                 None => {
                     pending_confirmation = None;
                     if let Some(bytes) = key_to_input(key) {
@@ -211,6 +225,17 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut LocalSession
                 pending_confirmation = None;
                 app.resize(session_size_from_app_terminal(rows, cols, sidebar_visible));
             }
+            Event::Mouse(mouse) => match mouse.kind {
+                MouseEventKind::ScrollUp => {
+                    pending_confirmation = None;
+                    app.scroll_selected(3);
+                }
+                MouseEventKind::ScrollDown => {
+                    pending_confirmation = None;
+                    app.scroll_selected(-3);
+                }
+                _ => {}
+            },
             _ => {}
         }
     }
@@ -221,22 +246,24 @@ fn draw(
     app: &LocalSessionApp,
     sidebar_visible: bool,
     pending_confirmation: Option<Confirmation>,
-) {
+) -> Rect {
     let root = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(1), Constraint::Length(1)])
         .split(frame.area());
 
-    if sidebar_visible {
+    let terminal_area = if sidebar_visible {
         let body = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Length(28), Constraint::Min(20)])
             .split(root[0]);
         draw_sidebar(frame, body[0], app);
         draw_terminal(frame, body[1], app.view());
+        body[1]
     } else {
         draw_terminal(frame, root[0], app.view());
-    }
+        root[0]
+    };
 
     draw_status(
         frame,
@@ -245,6 +272,7 @@ fn draw(
         app.last_error(),
         pending_confirmation,
     );
+    terminal_area
 }
 
 fn draw_sidebar(frame: &mut ratatui::Frame<'_>, area: Rect, app: &LocalSessionApp) {
@@ -256,7 +284,7 @@ fn draw_sidebar(frame: &mut ratatui::Frame<'_>, area: Rect, app: &LocalSessionAp
 
     frame.render_widget(
         Paragraph::new(rows)
-            .block(Block::default().title("Sessions").borders(Borders::ALL))
+            .block(Block::default().borders(Borders::RIGHT))
             .wrap(Wrap { trim: true }),
         area,
     );
@@ -300,12 +328,13 @@ fn session_sidebar_rows(index: usize, selected: usize, view: &SessionView) -> Ve
 }
 
 fn draw_terminal(frame: &mut ratatui::Frame<'_>, area: Rect, view: &SessionView) {
-    let visible_height = usize::from(area.height.saturating_sub(2));
+    let visible_height = usize::from(area.height);
     let start = view
         .snapshot
         .visible_rows
         .len()
-        .saturating_sub(visible_height);
+        .saturating_sub(visible_height)
+        .saturating_sub(view.scroll_offset);
     let render_cols = terminal_render_cols(area, view.snapshot.size.cols);
     let rows = if view.snapshot.styled_rows.len() == view.snapshot.visible_rows.len() {
         styled_rows_to_lines(&view.snapshot.styled_rows[start..], render_cols)
@@ -316,17 +345,14 @@ fn draw_terminal(frame: &mut ratatui::Frame<'_>, area: Rect, view: &SessionView)
             .collect::<Vec<_>>()
     };
 
-    frame.render_widget(
-        Paragraph::new(rows).block(Block::default().title("Terminal").borders(Borders::ALL)),
-        area,
-    );
+    frame.render_widget(Paragraph::new(rows), area);
     if let Some(position) = terminal_cursor_position(area, start, &view.snapshot.cursor) {
         frame.set_cursor_position(position);
     }
 }
 
 fn terminal_render_cols(area: Rect, _snapshot_cols: usize) -> usize {
-    usize::from(area.width.saturating_sub(2))
+    usize::from(area.width)
 }
 
 fn terminal_cursor_position(
@@ -338,17 +364,21 @@ fn terminal_cursor_position(
         return None;
     }
 
-    let inner_width = usize::from(area.width.saturating_sub(2));
-    let inner_height = usize::from(area.height.saturating_sub(2));
+    let inner_width = usize::from(area.width);
+    let inner_height = usize::from(area.height);
     let row = cursor.row - start_row;
     if cursor.col >= inner_width || row >= inner_height {
         return None;
     }
 
     Some(Position::new(
-        area.x + 1 + u16::try_from(cursor.col).ok()?,
-        area.y + 1 + u16::try_from(row).ok()?,
+        area.x + u16::try_from(cursor.col).ok()?,
+        area.y + u16::try_from(row).ok()?,
     ))
+}
+
+fn terminal_page_scroll_lines(area: Rect) -> isize {
+    isize::try_from(area.height.saturating_sub(1).max(1)).unwrap_or(1)
 }
 
 fn styled_rows_to_lines(rows: &[StyledRow], cols: usize) -> Vec<Line<'static>> {
@@ -404,6 +434,9 @@ fn ratatui_style(style: &TerminalStyle) -> Style {
     if style.bold {
         output = output.add_modifier(Modifier::BOLD);
     }
+    if style.dim {
+        output = output.add_modifier(Modifier::DIM);
+    }
     if style.italic {
         output = output.add_modifier(Modifier::ITALIC);
     }
@@ -441,7 +474,7 @@ fn draw_status(
         ))
     } else {
         Line::from(format!(
-            "seq {}  bytes {}  Ctrl-N new  Ctrl-W close  F2 tabs  Alt-arrows switch  Ctrl-Q exit",
+            "seq {}  bytes {}  PgUp/PgDn scroll  Ctrl-N new  Ctrl-W close  F2 tabs  Alt-arrows switch  Ctrl-Q exit",
             view.snapshot.output_seq, view.snapshot.bytes_logged
         ))
     };
@@ -470,6 +503,8 @@ enum AppCommand {
     Next,
     Previous,
     ToggleSidebar,
+    ScrollUp,
+    ScrollDown,
 }
 
 fn key_to_command(key: KeyEvent) -> Option<AppCommand> {
@@ -491,6 +526,8 @@ fn key_to_command(key: KeyEvent) -> Option<AppCommand> {
             Some(AppCommand::Previous)
         }
         KeyCode::F(2) => Some(AppCommand::ToggleSidebar),
+        KeyCode::PageUp => Some(AppCommand::ScrollUp),
+        KeyCode::PageDown => Some(AppCommand::ScrollDown),
         _ => None,
     }
 }
@@ -540,9 +577,9 @@ fn current_session_size(sidebar_visible: bool) -> Result<SessionSize> {
 }
 
 fn session_size_from_app_terminal(rows: u16, cols: u16, sidebar_visible: bool) -> SessionSize {
-    let horizontal_chrome = if sidebar_visible { 30 } else { 2 };
+    let horizontal_chrome = if sidebar_visible { 28 } else { 0 };
     session_size_from_terminal(
-        rows.saturating_sub(3),
+        rows.saturating_sub(1),
         cols.saturating_sub(horizontal_chrome),
     )
 }
@@ -556,7 +593,7 @@ impl TerminalSession {
     fn enter() -> Result<Self> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen)?;
+        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
         terminal.clear()?;
@@ -573,7 +610,11 @@ impl TerminalSession {
         }
 
         disable_raw_mode()?;
-        execute!(self.terminal.backend_mut(), LeaveAlternateScreen)?;
+        execute!(
+            self.terminal.backend_mut(),
+            DisableMouseCapture,
+            LeaveAlternateScreen
+        )?;
         self.terminal.show_cursor()?;
         self.restored = true;
         Ok(())
@@ -646,6 +687,14 @@ mod tests {
             Some(AppCommand::ToggleSidebar)
         );
         assert_eq!(
+            key_to_command(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE)),
+            Some(AppCommand::ScrollUp)
+        );
+        assert_eq!(
+            key_to_command(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE)),
+            Some(AppCommand::ScrollDown)
+        );
+        assert_eq!(
             key_to_command(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
             None
         );
@@ -655,30 +704,30 @@ mod tests {
     fn session_size_matches_terminal_pane_inner_area() {
         let size = session_size_from_app_terminal(24, 100, true);
 
-        assert_eq!(size.rows, 21);
-        assert_eq!(size.cols, 70);
+        assert_eq!(size.rows, 23);
+        assert_eq!(size.cols, 72);
     }
 
     #[test]
     fn session_size_expands_when_sidebar_is_hidden() {
         let size = session_size_from_app_terminal(24, 100, false);
 
-        assert_eq!(size.rows, 21);
-        assert_eq!(size.cols, 98);
+        assert_eq!(size.rows, 23);
+        assert_eq!(size.cols, 100);
     }
 
     #[test]
     fn terminal_render_cols_expands_to_terminal_pane_width() {
         let area = Rect::new(0, 0, 102, 24);
 
-        assert_eq!(terminal_render_cols(area, 80), 100);
+        assert_eq!(terminal_render_cols(area, 80), 102);
     }
 
     #[test]
     fn terminal_render_cols_uses_terminal_pane_width_when_snapshot_is_wider() {
         let area = Rect::new(0, 0, 72, 24);
 
-        assert_eq!(terminal_render_cols(area, 100), 70);
+        assert_eq!(terminal_render_cols(area, 100), 72);
     }
 
     #[test]
@@ -743,8 +792,18 @@ mod tests {
 
         assert_eq!(
             terminal_cursor_position(area, 3, &cursor),
-            Some(Position::new(18, 23))
+            Some(Position::new(17, 22))
         );
+    }
+
+    #[test]
+    fn dim_terminal_style_maps_to_ratatui_modifier() {
+        let style = ratatui_style(&TerminalStyle {
+            dim: true,
+            ..TerminalStyle::default()
+        });
+
+        assert!(style.add_modifier.contains(Modifier::DIM));
     }
 
     #[test]

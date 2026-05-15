@@ -31,11 +31,21 @@
 - Disabled Ratatui paragraph wrapping for terminal output and padded rows only to the visible pane width so stale/wider snapshots cannot wrap into an extra full-width row.
 - Removed blank-row deletion from TUI projection, forwarded only key press events to child terminals, and carried terminal cursor coordinates through snapshots so child TUI input stays in place.
 - Suppressed default info-level `wezterm_term` bell logs so child BEL output does not leak "Ding!" diagnostics into Argus terminal sessions.
+- Reattached daemon sessions as observers, then acquired the input lease and resized only the selected session so startup does not mutate background sessions.
+- Cleared stale styled rows on exit events, preserved terminal dim/faint intensity for placeholder hint text, and chained an existing `PROMPT_COMMAND` when installing OSC 7 cwd reporting.
+- Removed the terminal pane border/title, adjusted PTY sizing and cursor math for the unframed pane, and added mouse wheel plus PageUp/PageDown scrollback for the selected session.
+- Returned retained daemon terminal scrollback in session snapshots and adjusted cursor rows into that scrollback-backed coordinate space so manual TUI scrolling has history to display.
+- Removed the top, left, and bottom border from the sessions sidebar so only the terminal separator remains.
+- Suppressed expected Unix socket disconnect logs so dropped TUI event subscriptions do not look like daemon failures or corrupt a co-located TUI display.
+- Bounded unterminated OSC 7 cwd parsing buffers and gave each TUI app instance a unique local client id so daemon input leases are not shared by simultaneous TUIs.
+- Removed terminal mouse capture so the terminal emulator keeps ownership of text selection and copy/paste; PageUp/PageDown remain the TUI scrollback controls.
+- Restored terminal mouse capture and routed mouse wheel events to selected-session scrollback so wheel input does not reach the child shell as history navigation.
 
 ## Commits
 - 472806b — feat: make TUI daemon-first
 - 1c53b54 — fix: clean up TUI startup options
-- HEAD — fix: preserve TUI session cwd and styles
+- 45ce48d — fix: preserve TUI session cwd and styles
+- HEAD — fix: restore TUI mouse wheel scrollback
 
 ## Progress
 - 2026-05-14T18:00-0700 — Created `feat/daemon-first-tui` worktree from `origin/main`, unset the accidental upstream, and inspected the current TUI socket fallback.
@@ -62,3 +72,14 @@
 - 2026-05-14T20:06-0700 — Disabled outer paragraph wrapping for the terminal pane and made styled row padding use the visible pane width, preventing over-wide snapshots from rendering as extra full-width visual rows.
 - 2026-05-14T22:09-0700 — Reverted blank-row collapse to preserve terminal geometry, filtered non-press key events to avoid duplicate child input, and added cursor position metadata from the daemon terminal model to the TUI renderer.
 - 2026-05-14T22:15-0700 — Raised the default log filter for `wezterm_term::terminalstate::performer` bell diagnostics to warn, keeping BEL events out of default daemon console/file logs.
+- 2026-05-14T22:25-0700 — Addressed critical review findings and manual TUI feedback: daemon reattach observes background sessions, selected-session activation owns lease/resize, exit events drop stale styles, dim text remains dim, the terminal pane is unframed, and mouse wheel/PageUp/PageDown scroll the displayed session.
+- 2026-05-14T22:25-0700 — Validation passed: `cargo fmt --all -- --check`, `/home/dberrios/.cargo/bin/cargo test -p argus-tui -p argus-daemon`, and `cargo clippy --all-targets --all-features -- -D warnings`.
+- 2026-05-14T22:31-0700 — Fixed manual scrollback by snapshotting retained daemon terminal rows instead of only the physical viewport, with cursor coordinates rebased for the longer row list.
+- 2026-05-14T22:47-0700 — Removed the top, left, and bottom border from the sessions sidebar, leaving only the right separator.
+- 2026-05-14T22:50-0700 — Treated broken-pipe/reset/EOF Unix socket writes as expected client disconnects and added coverage for context-wrapped broken-pipe detection.
+- 2026-05-15T07:01-0700 — Addressed review findings by keeping OSC 7 buffer trimming on the unterminated path and generating per-app TUI client ids for daemon leases.
+- 2026-05-15T07:01-0700 — Validation passed: `/home/dberrios/.cargo/bin/cargo test -p argus-daemon -p argus-tui`.
+- 2026-05-15T07:07-0700 — Suppressed expected broken-pipe/reset/EOF Unix socket disconnect logging entirely so verbose daemon output cannot overwrite the TUI screen.
+- 2026-05-15T07:18-0700 — Removed terminal mouse capture so normal terminal copy/paste selection works in Argus, keeping PageUp/PageDown for scrollback, and reacquired the input lease after closing the selected daemon-backed session.
+- 2026-05-15T07:29-0700 — Restored terminal mouse capture and handled scroll-wheel events in the TUI event loop so mouse scrolling moves Argus scrollback instead of the child shell input history.
+- 2026-05-15T07:30-0700 — Validation passed: `cargo fmt --all -- --check` and `/home/dberrios/.cargo/bin/cargo test -p argus-tui -p argus-daemon`.

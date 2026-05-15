@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::TryRecvError;
 
 use anyhow::Result;
@@ -19,6 +20,7 @@ pub struct SessionView {
     pub snapshot: SessionSnapshot,
     pub lease: InputLeaseState,
     pub last_completed: Option<CompletedSession>,
+    pub scroll_offset: usize,
 }
 
 pub struct LocalSessionApp {
@@ -27,6 +29,7 @@ pub struct LocalSessionApp {
     owns_sessions: bool,
     sessions: Vec<SessionRuntime>,
     selected: usize,
+    current_size: SessionSize,
     last_error: Option<String>,
 }
 
@@ -56,7 +59,7 @@ impl LocalSessionApp {
         size: SessionSize,
         owns_sessions: bool,
     ) -> Result<Self> {
-        let client_id = ClientId::new("local-tui")?;
+        let client_id = local_tui_client_id()?;
         let mut sessions = if owns_sessions {
             Vec::new()
         } else {
@@ -67,27 +70,31 @@ impl LocalSessionApp {
             sessions.push(start_local_session(
                 manager.as_ref(),
                 &client_id,
-                size,
+                size.clone(),
                 std::env::current_dir().ok(),
             )?);
         }
 
-        Ok(Self {
+        let mut app = Self {
             manager,
             client_id,
             owns_sessions,
             sessions,
             selected: 0,
+            current_size: size,
             last_error: None,
-        })
+        };
+        app.activate_selected_session();
+        Ok(app)
     }
 
     pub fn create_session(&mut self, size: SessionSize) {
         let cwd = self.view().snapshot.current_working_directory.clone();
-        match start_local_session(self.manager.as_ref(), &self.client_id, size, cwd) {
+        match start_local_session(self.manager.as_ref(), &self.client_id, size.clone(), cwd) {
             Ok(session) => {
                 self.sessions.push(session);
                 self.selected = self.sessions.len() - 1;
+                self.current_size = size;
                 self.last_error = None;
             }
             Err(error) => {
@@ -114,6 +121,7 @@ impl LocalSessionApp {
             self.selected = self.sessions.len() - 1;
         }
         self.last_error = None;
+        self.activate_selected_session();
     }
 
     pub fn select_next_session(&mut self) {
@@ -122,7 +130,7 @@ impl LocalSessionApp {
         }
 
         self.selected = (self.selected + 1) % self.sessions.len();
-        self.last_error = None;
+        self.activate_selected_session();
     }
 
     pub fn select_previous_session(&mut self) {
@@ -131,7 +139,7 @@ impl LocalSessionApp {
         }
 
         self.selected = (self.selected + self.sessions.len() - 1) % self.sessions.len();
-        self.last_error = None;
+        self.activate_selected_session();
     }
 
     pub fn sessions(&self) -> impl ExactSizeIterator<Item = &SessionView> {
@@ -152,6 +160,33 @@ impl LocalSessionApp {
 
     pub fn exits_by_shutting_down_sessions(&self) -> bool {
         self.owns_sessions
+    }
+
+    pub fn scroll_selected(&mut self, lines: isize) {
+        let Some(session) = self.sessions.get_mut(self.selected) else {
+            return;
+        };
+
+        let max_offset = session.view.snapshot.visible_rows.len().saturating_sub(1);
+        session.view.scroll_offset = if lines.is_negative() {
+            session
+                .view
+                .scroll_offset
+                .saturating_sub(lines.unsigned_abs())
+        } else {
+            session
+                .view
+                .scroll_offset
+                .saturating_add(lines as usize)
+                .min(max_offset)
+        };
+        self.last_error = None;
+    }
+
+    pub fn reset_selected_scroll(&mut self) {
+        if let Some(session) = self.sessions.get_mut(self.selected) {
+            session.view.scroll_offset = 0;
+        }
     }
 
     pub fn drain_events(&mut self) {
@@ -177,9 +212,7 @@ impl LocalSessionApp {
             if refresh_snapshot && !session.view.snapshot.exited {
                 let session_id = session.view.session_id.clone();
                 match self.manager.snapshot_session(session_id) {
-                    Ok(snapshot) => {
-                        session.view.snapshot = snapshot;
-                    }
+                    Ok(snapshot) => session.view.snapshot = snapshot,
                     Err(error) => {
                         self.last_error = Some(format!(
                             "refreshing session snapshot after output events: {error}"
@@ -211,30 +244,8 @@ impl LocalSessionApp {
     }
 
     pub fn resize(&mut self, size: SessionSize) {
-        let mut resize_error = None;
-        let mut resized_any = false;
-
-        for session in &mut self.sessions {
-            if session.view.snapshot.size == size || session.view.snapshot.exited {
-                continue;
-            }
-
-            resized_any = true;
-            match self.manager.resize_session(ResizeSessionRequest {
-                session_id: session.view.session_id.clone(),
-                size: size.clone(),
-            }) {
-                Ok(snapshot) => {
-                    session.view.snapshot = snapshot;
-                }
-                Err(error) if resize_error.is_none() => resize_error = Some(error.to_string()),
-                Err(_) => {}
-            }
-        }
-
-        if resize_error.is_some() || resized_any {
-            self.last_error = resize_error;
-        }
+        self.current_size = size;
+        self.resize_selected_session();
     }
 
     pub fn shutdown(self) -> Result<Vec<CompletedSession>> {
@@ -261,26 +272,75 @@ impl LocalSessionApp {
         result?;
         Ok(completed_sessions)
     }
+
+    fn activate_selected_session(&mut self) {
+        self.acquire_selected_input_lease();
+        self.resize_selected_session();
+    }
+
+    fn acquire_selected_input_lease(&mut self) {
+        let Some(session) = self.sessions.get_mut(self.selected) else {
+            return;
+        };
+        if session.view.snapshot.exited
+            || session
+                .view
+                .lease
+                .holder
+                .as_ref()
+                .is_some_and(|holder| holder.client_id == self.client_id)
+        {
+            return;
+        }
+
+        match self
+            .manager
+            .acquire_input_lease(argus_core::session::InputLeaseRequest {
+                session_id: session.view.session_id.clone(),
+                client_id: self.client_id.clone(),
+                kind: argus_core::session::InputControllerKind::Interactive,
+            }) {
+            Ok(change) => {
+                session.view.lease = InputLeaseState {
+                    holder: change.current,
+                    generation: change.generation,
+                };
+                self.last_error = None;
+            }
+            Err(error) => self.last_error = Some(format!("acquiring input lease: {error}")),
+        }
+    }
+
+    fn resize_selected_session(&mut self) {
+        let Some(session) = self.sessions.get_mut(self.selected) else {
+            return;
+        };
+        if session.view.snapshot.exited || session.view.snapshot.size == self.current_size {
+            return;
+        }
+
+        match self.manager.resize_session(ResizeSessionRequest {
+            session_id: session.view.session_id.clone(),
+            size: self.current_size.clone(),
+        }) {
+            Ok(snapshot) => {
+                session.view.snapshot = snapshot;
+                self.last_error = None;
+            }
+            Err(error) => self.last_error = Some(format!("resizing selected session: {error}")),
+        }
+    }
 }
 
 fn attach_existing_sessions(
     manager: &dyn SessionApi,
     client_id: &ClientId,
-    size: SessionSize,
+    _size: SessionSize,
 ) -> Result<Vec<SessionRuntime>> {
     let mut sessions = Vec::new();
 
     for session_id in manager.list_sessions()? {
-        let mut session = attach_existing_session(manager, client_id, session_id)?;
-        if !session.view.snapshot.exited && session.view.snapshot.size != size {
-            match manager.resize_session(ResizeSessionRequest {
-                session_id: session.view.session_id.clone(),
-                size: size.clone(),
-            }) {
-                Ok(snapshot) => session.view.snapshot = snapshot,
-                Err(error) => tracing::warn!(error = ?error, "failed to resize reattached session"),
-            }
-        }
+        let session = attach_existing_session(manager, client_id, session_id)?;
         sessions.push(session);
     }
 
@@ -296,7 +356,7 @@ fn attach_existing_session(
     let attached = manager.attach_session(AttachSessionRequest {
         session_id: session_id.clone(),
         client_id: client_id.clone(),
-        mode: AttachMode::InteractiveController,
+        mode: AttachMode::Observer,
     })?;
 
     Ok(SessionRuntime {
@@ -306,6 +366,7 @@ fn attach_existing_session(
             snapshot: attached.snapshot,
             lease: attached.lease,
             last_completed: None,
+            scroll_offset: 0,
         },
     })
 }
@@ -347,6 +408,7 @@ fn start_local_session(
             snapshot: attached.snapshot,
             lease: attached.lease,
             last_completed: None,
+            scroll_offset: 0,
         },
     })
 }
@@ -375,6 +437,7 @@ pub fn apply_event_to_view(view: &mut SessionView, event: SessionEvent) -> bool 
             view.snapshot.output_seq = completed.output_seq;
             view.snapshot.bytes_logged = completed.bytes_logged;
             view.snapshot.visible_rows = completed.visible_rows.clone();
+            view.snapshot.styled_rows.clear();
             view.snapshot.exited = true;
             view.last_completed = Some(completed);
             false
@@ -405,6 +468,16 @@ fn default_tui_log_dir() -> PathBuf {
         .join("argus/tui-sessions")
 }
 
+fn local_tui_client_id() -> Result<ClientId> {
+    static NEXT_CLIENT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+    ClientId::new(format!(
+        "local-tui-{}-{}",
+        std::process::id(),
+        NEXT_CLIENT_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
 #[cfg(windows)]
 fn default_shell_request() -> StartSessionRequest {
     StartSessionRequest::new("cmd.exe")
@@ -415,7 +488,7 @@ fn default_shell_request() -> StartSessionRequest {
     let mut request = StartSessionRequest::new("/bin/sh");
     request.args = vec![
         "-lc".to_string(),
-        "stty sane echo; export PROMPT_COMMAND='printf \"\\033]7;file://%s%s\\033\\\\\" \"${HOSTNAME:-localhost}\" \"$PWD\"'; exec \"${SHELL:-/bin/sh}\""
+        "stty sane echo; export ARGUS_PROMPT_COMMAND=\"$PROMPT_COMMAND\"; export PROMPT_COMMAND='printf \"\\033]7;file://%s%s\\033\\\\\" \"${HOSTNAME:-localhost}\" \"$PWD\"; if [ -n \"$ARGUS_PROMPT_COMMAND\" ]; then eval \"$ARGUS_PROMPT_COMMAND\"; fi'; exec \"${SHELL:-/bin/sh}\""
             .to_string(),
     ];
     request
@@ -462,6 +535,7 @@ mod tests {
     fn exited_event_marks_snapshot_exited() {
         let session_id = SessionId::new("session-1").expect("session id");
         let mut view = test_view(session_id.clone());
+        view.snapshot.styled_rows = vec![argus_core::session::StyledRow { spans: Vec::new() }];
 
         apply_event_to_view(
             &mut view,
@@ -478,6 +552,7 @@ mod tests {
         assert!(view.snapshot.exited);
         assert_eq!(view.snapshot.output_seq, 3);
         assert_eq!(view.snapshot.visible_rows, ["done"]);
+        assert!(view.snapshot.styled_rows.is_empty());
         assert!(view.last_completed.is_some());
     }
 
@@ -652,7 +727,61 @@ mod tests {
         assert_eq!(app.sessions().len(), 2);
         assert_eq!(app.selected_index(), 0);
         assert_eq!(app.view().session_id, SessionId::new("session-7").unwrap());
-        assert_eq!(counts.lock().expect("counts lock").starts, 0);
+        let counts = counts.lock().expect("counts lock");
+        assert_eq!(counts.starts, 0);
+        assert_eq!(counts.acquires, 1);
+    }
+
+    #[test]
+    fn daemon_backed_app_reacquires_input_lease_after_closing_selected_session() {
+        let counts = Arc::new(Mutex::new(RecordingCounts::default()));
+        let mut app = LocalSessionApp::start_with_manager(
+            Box::new(RecordingSessionApi {
+                counts: counts.clone(),
+                session_ids: vec![
+                    SessionId::new("session-7").expect("session id"),
+                    SessionId::new("session-8").expect("session id"),
+                ],
+            }),
+            SessionSize::default(),
+            false,
+        )
+        .expect("start daemon-backed app");
+
+        app.close_selected_session();
+
+        assert_eq!(app.sessions().len(), 1);
+        assert_eq!(app.selected_index(), 0);
+        assert_eq!(app.view().session_id, SessionId::new("session-8").unwrap());
+        let counts = counts.lock().expect("counts lock");
+        assert_eq!(counts.shutdowns, 1);
+        assert_eq!(counts.acquires, 2);
+    }
+
+    #[test]
+    fn daemon_backed_apps_use_unique_client_ids() {
+        let first = LocalSessionApp::start_with_manager(
+            Box::new(RecordingSessionApi {
+                counts: Arc::new(Mutex::new(RecordingCounts::default())),
+                session_ids: vec![SessionId::new("session-1").expect("session id")],
+            }),
+            SessionSize::default(),
+            false,
+        )
+        .expect("start first daemon-backed app");
+        let second = LocalSessionApp::start_with_manager(
+            Box::new(RecordingSessionApi {
+                counts: Arc::new(Mutex::new(RecordingCounts::default())),
+                session_ids: vec![SessionId::new("session-2").expect("session id")],
+            }),
+            SessionSize::default(),
+            false,
+        )
+        .expect("start second daemon-backed app");
+
+        assert_ne!(first.client_id, second.client_id);
+        assert!(first.client_id.as_str().starts_with("local-tui-"));
+        assert!(second.client_id.as_str().starts_with("local-tui-"));
     }
 
     fn test_view(session_id: SessionId) -> SessionView {
@@ -674,6 +803,7 @@ mod tests {
             },
             lease: InputLeaseState::default(),
             last_completed: None,
+            scroll_offset: 0,
         }
     }
 
@@ -688,6 +818,7 @@ mod tests {
     #[derive(Default)]
     struct RecordingCounts {
         starts: usize,
+        acquires: usize,
         releases: usize,
         shutdowns: usize,
     }
@@ -738,8 +869,17 @@ mod tests {
             Ok(rx)
         }
 
-        fn acquire_input_lease(&self, _request: InputLeaseRequest) -> Result<LeaseChange> {
-            unreachable!("test does not acquire leases")
+        fn acquire_input_lease(&self, request: InputLeaseRequest) -> Result<LeaseChange> {
+            self.counts.lock().expect("counts lock").acquires += 1;
+            Ok(LeaseChange {
+                generation: 2,
+                previous: None,
+                current: Some(InputLeaseHolder {
+                    client_id: request.client_id,
+                    kind: request.kind,
+                }),
+                action: LeaseChangeAction::Acquired,
+            })
         }
 
         fn release_input_lease(

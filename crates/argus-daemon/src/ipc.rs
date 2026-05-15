@@ -54,7 +54,9 @@ impl UnixSocketServer {
                         .name("argus-ipc-client".to_string())
                         .spawn(move || {
                             if let Err(error) = handle_connection(manager, stream) {
-                                tracing::warn!(error = ?error, "Unix socket client failed");
+                                if !is_closed_socket_error(&error) {
+                                    tracing::warn!(error = ?error, "Unix socket client failed");
+                                }
                             }
                         })
                     {
@@ -463,6 +465,19 @@ fn write_json_line<T: Serialize>(writer: &mut impl Write, value: &T) -> Result<(
     writer.write_all(b"\n").context("terminating JSON line")
 }
 
+fn is_closed_socket_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io_error| {
+                matches!(
+                    io_error.kind(),
+                    ErrorKind::BrokenPipe | ErrorKind::ConnectionReset | ErrorKind::UnexpectedEof
+                )
+            })
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -492,6 +507,15 @@ mod tests {
         assert!(error.to_string().contains("not found"));
         let _ = fs::remove_file(socket_path);
         let _ = fs::remove_dir_all(log_dir);
+    }
+
+    #[test]
+    fn closed_socket_errors_are_expected_client_disconnects() {
+        let error = Err::<(), _>(std::io::Error::from(ErrorKind::BrokenPipe))
+            .context("flushing subscription response")
+            .expect_err("broken pipe should stay an error");
+
+        assert!(is_closed_socket_error(&error));
     }
 
     #[test]

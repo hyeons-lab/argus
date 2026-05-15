@@ -45,7 +45,8 @@
 - 472806b — feat: make TUI daemon-first
 - 1c53b54 — fix: clean up TUI startup options
 - 45ce48d — fix: preserve TUI session cwd and styles
-- HEAD — fix: restore TUI mouse wheel scrollback
+- d93e7fc — fix: restore TUI mouse wheel scrollback
+- HEAD — fix: satisfy daemon IPC clippy lint
 
 ## Progress
 - 2026-05-14T18:00-0700 — Created `feat/daemon-first-tui` worktree from `origin/main`, unset the accidental upstream, and inspected the current TUI socket fallback.
@@ -83,3 +84,5 @@
 - 2026-05-15T07:18-0700 — Removed terminal mouse capture so normal terminal copy/paste selection works in Argus, keeping PageUp/PageDown for scrollback, and reacquired the input lease after closing the selected daemon-backed session.
 - 2026-05-15T07:29-0700 — Restored terminal mouse capture and handled scroll-wheel events in the TUI event loop so mouse scrolling moves Argus scrollback instead of the child shell input history.
 - 2026-05-15T07:30-0700 — Validation passed: `cargo fmt --all -- --check` and `/home/dberrios/.cargo/bin/cargo test -p argus-tui -p argus-daemon`.
+- 2026-05-15T07:32-0700 — Fixed CI's `clippy::collapsible-if` warning in the Unix socket disconnect handler after the pushed run failed in Format and Lint.
+- 2026-05-15T07:33-0700 — Validation passed: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`, and `/home/dberrios/.cargo/bin/cargo test -p argus-tui -p argus-daemon`.

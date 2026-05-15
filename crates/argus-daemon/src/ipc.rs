@@ -53,10 +53,10 @@ impl UnixSocketServer {
                     if let Err(error) = thread::Builder::new()
                         .name("argus-ipc-client".to_string())
                         .spawn(move || {
-                            if let Err(error) = handle_connection(manager, stream) {
-                                if !is_closed_socket_error(&error) {
-                                    tracing::warn!(error = ?error, "Unix socket client failed");
-                                }
+                            if let Err(error) = handle_connection(manager, stream)
+                                && !is_closed_socket_error(&error)
+                            {
+                                tracing::warn!(error = ?error, "Unix socket client failed");
                             }
                         })
                     {

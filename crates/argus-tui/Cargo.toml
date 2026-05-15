@@ -11,6 +11,7 @@ authors.workspace = true
 argus-core = { path = "../argus-core" }
 argus-daemon = { path = "../argus-daemon" }
 anyhow.workspace = true
+base64.workspace = true
 crossterm.workspace = true
 ratatui.workspace = true
 tracing.workspace = true

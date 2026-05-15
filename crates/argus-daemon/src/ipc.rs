@@ -466,16 +466,15 @@ fn write_json_line<T: Serialize>(writer: &mut impl Write, value: &T) -> Result<(
 }
 
 fn is_closed_socket_error(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| {
-        cause
-            .downcast_ref::<std::io::Error>()
-            .is_some_and(|io_error| {
-                matches!(
-                    io_error.kind(),
-                    ErrorKind::BrokenPipe | ErrorKind::ConnectionReset | ErrorKind::UnexpectedEof
-                )
-            })
-    })
+    error
+        .root_cause()
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|io_error| {
+            matches!(
+                io_error.kind(),
+                ErrorKind::BrokenPipe | ErrorKind::ConnectionReset | ErrorKind::UnexpectedEof
+            )
+        })
 }
 
 #[cfg(test)]
@@ -516,6 +515,16 @@ mod tests {
             .expect_err("broken pipe should stay an error");
 
         assert!(is_closed_socket_error(&error));
+    }
+
+    #[test]
+    fn closed_socket_detection_only_matches_root_cause() {
+        let error = anyhow!(
+            "flushing subscription response: {}",
+            std::io::Error::from(ErrorKind::BrokenPipe)
+        );
+
+        assert!(!is_closed_socket_error(&error));
     }
 
     #[test]

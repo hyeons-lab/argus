@@ -51,6 +51,9 @@
 - Restored raw PTY line-feed handling in the daemon terminal model and wrapped outer Crossterm paste events with bracketed paste markers before forwarding them to child applications.
 - Decoded percent-escaped OSC 7 file URI paths before storing daemon session cwd metadata.
 - Refreshed a final styled daemon snapshot after exit events so live TUI views keep terminal colors the same way reattached views do.
+- Made terminal mouse selection activate only after a drag so a plain click does not draw a reversed cell or switch the terminal pane to unstyled selection rendering.
+- Preserved styled terminal spans during active text selection by applying selection highlighting on top of foreground and background colors.
+- Addressed PR review and typing-latency feedback by lowering the TUI event poll interval, avoiding cwd OSC scans for ordinary output chunks, tightening selection bounds, replacing manual Base64 encoding, narrowing closed-socket suppression, and making style/sidebar calculations less fragile.
 
 ## Commits
 - 472806b — feat: make TUI daemon-first
@@ -60,7 +63,8 @@
 - bf8d127 — fix: satisfy daemon IPC clippy lint
 - abfe7b9 — fix: polish terminal selection and rendering
 - f41bb6e — fix: restore paste and color behavior
-- HEAD — fix: preserve exited session colors
+- aab5126 — fix: preserve exited session colors
+- HEAD — fix: address daemon TUI review feedback
 
 ## Progress
 - 2026-05-14T18:00-0700 — Created `feat/daemon-first-tui` worktree from `origin/main`, unset the accidental upstream, and inspected the current TUI socket fallback.
@@ -118,3 +122,6 @@
 - 2026-05-15T11:58-0700 — Addressed review feedback by decoding percent-escaped OSC 7 cwd file URI paths before reusing them for daemon session cwd metadata.
 - 2026-05-15T11:59-0700 — Validation passed: `cargo fmt --all -- --check`, `/home/dberrios/.cargo/bin/cargo test -p argus-daemon`, `cargo clippy -p argus-daemon --all-targets --all-features --locked -- -D warnings`, and `git diff --check`.
 - 2026-05-15T12:10-0700 — Fixed live exited-session rendering by treating `SessionEvent::Exited` as a final snapshot refresh trigger, preserving styled terminal rows after the shell exits.
+- 2026-05-15T12:33-0700 — Kept mouse-down as a pending selection until the pointer moves, preventing plain terminal clicks from drawing a single-cell selection or dropping styled terminal colors.
+- 2026-05-15T12:36-0700 — Updated active selection rendering to split styled spans at selected character bounds and retain their existing foreground/background styles while marking selected segments.
+- 2026-05-15T13:05-0700 — Inspected unresolved PR #17 review threads and patched the hot typing/output path plus actionable TUI/daemon cleanup comments, including root-cause-only closed-socket suppression.

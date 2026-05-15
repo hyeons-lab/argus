@@ -17,6 +17,7 @@ all = "warn"
 
 [workspace.dependencies]
 anyhow = "1"
+base64 = "0.22"
 crossterm = "0.28"
 insta = "1"
 portable-pty = "0.9"

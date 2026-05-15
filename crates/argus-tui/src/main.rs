@@ -8,6 +8,7 @@ use argus_core::session::{
     InputControllerKind, SessionSize, StyledRow, TerminalColor, TerminalCursor, TerminalStyle,
 };
 use argus_tui::{LocalSessionApp, SessionView, session_size_from_terminal};
+use base64::Engine;
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -22,6 +23,9 @@ use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+
+const SIDEBAR_COLS: u16 = 28;
+const UI_EVENT_POLL: Duration = Duration::from_millis(8);
 
 fn main() -> Result<()> {
     let startup_mode = StartupMode::from_args(std::env::args_os().skip(1))?;
@@ -165,7 +169,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut LocalSession
             terminal_area = draw(frame, app, sidebar_visible, pending_confirmation, selection);
         })?;
 
-        if !event::poll(Duration::from_millis(50))? {
+        if !event::poll(UI_EVENT_POLL)? {
             continue;
         }
 
@@ -280,7 +284,7 @@ fn draw(
     let terminal_area = if sidebar_visible {
         let body = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Length(28), Constraint::Min(20)])
+            .constraints([Constraint::Length(SIDEBAR_COLS), Constraint::Min(20)])
             .split(root[0]);
         draw_sidebar(frame, body[0], app);
         draw_terminal(frame, body[1], app.view(), selection);
@@ -369,14 +373,20 @@ fn draw_terminal(
         .saturating_add(visible_height)
         .min(view.snapshot.visible_rows.len());
     let render_cols = terminal_render_cols(area, view.snapshot.size.cols);
-    let selection = selection.map(|selection| selection.to_visible_range(start));
+    let selection = selection
+        .filter(|selection| selection.is_active())
+        .map(|selection| selection.to_visible_range(start));
     let rows = if let Some(selection) = selection {
-        selected_rows_to_lines(
-            &view.snapshot.visible_rows[start..end],
-            render_cols,
-            start,
-            selection,
-        )
+        if let Some(styled_rows) = styled_rows_for_visible_range(&view.snapshot, start, end) {
+            styled_selected_rows_to_lines(styled_rows, render_cols, start, selection)
+        } else {
+            selected_rows_to_lines(
+                &view.snapshot.visible_rows[start..end],
+                render_cols,
+                start,
+                selection,
+            )
+        }
     } else if let Some(styled_rows) = styled_rows_for_visible_range(&view.snapshot, start, end) {
         styled_rows_to_lines(styled_rows, render_cols)
     } else {
@@ -444,6 +454,10 @@ impl TerminalSelection {
 
     fn update(&mut self, point: TerminalPoint) {
         self.end = point;
+    }
+
+    fn is_active(self) -> bool {
+        self.start != self.end
     }
 
     fn to_visible_range(self, first_visible_row: usize) -> VisibleSelection {
@@ -523,6 +537,10 @@ fn handle_mouse_event(
                 selected.update(point);
                 *selection = Some(selected);
             }
+            if !selected.is_active() {
+                *selection = None;
+                return Ok(true);
+            }
             let text = selected_text(app.view(), terminal_area, selected);
             if !text.trim().is_empty() {
                 write_osc52_clipboard(output, &text)?;
@@ -593,6 +611,10 @@ fn copy_selection_on_control_c(
     let Some(selected) = *selection else {
         return Ok(false);
     };
+    if !selected.is_active() {
+        *selection = None;
+        return Ok(false);
+    }
 
     let text = selected_text(view, area, selected);
     if !text.trim().is_empty() {
@@ -662,12 +684,18 @@ fn selected_row_bounds(
     row_index: usize,
     selection: VisibleSelection,
 ) -> Option<(usize, usize)> {
+    selected_row_bounds_for_width(row.chars().count(), row_index, selection)
+}
+
+fn selected_row_bounds_for_width(
+    row_width: usize,
+    row_index: usize,
+    selection: VisibleSelection,
+) -> Option<(usize, usize)> {
     if row_index < selection.start.row || row_index > selection.end.row {
         return None;
     }
 
-    let row_len = row.chars().count();
-    let end_of_row = row_len.max(selection.end.col.saturating_add(1));
     let start = if row_index == selection.start.row {
         selection.start.col
     } else {
@@ -676,7 +704,7 @@ fn selected_row_bounds(
     let end = if row_index == selection.end.row {
         selection.end.col.saturating_add(1)
     } else {
-        end_of_row
+        row_width
     };
 
     if start >= end {
@@ -717,38 +745,15 @@ fn slice_chars(value: &str, start: usize, end: usize) -> String {
 fn write_osc52_clipboard(output: &mut CrosstermBackend<Stdout>, text: &str) -> Result<()> {
     use std::io::Write;
 
-    write!(output, "\x1b]52;c;{}\x07", base64_encode(text.as_bytes()))
-        .context("writing terminal clipboard selection")?;
+    write!(
+        output,
+        "\x1b]52;c;{}\x07",
+        base64::engine::general_purpose::STANDARD.encode(text.as_bytes())
+    )
+    .context("writing terminal clipboard selection")?;
     output
         .flush()
         .context("flushing terminal clipboard selection")
-}
-
-fn base64_encode(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut output = String::with_capacity(bytes.len().div_ceil(3) * 4);
-
-    for chunk in bytes.chunks(3) {
-        let first = chunk[0];
-        let second = *chunk.get(1).unwrap_or(&0);
-        let third = *chunk.get(2).unwrap_or(&0);
-        let value = ((first as u32) << 16) | ((second as u32) << 8) | third as u32;
-
-        output.push(ALPHABET[((value >> 18) & 0x3f) as usize] as char);
-        output.push(ALPHABET[((value >> 12) & 0x3f) as usize] as char);
-        if chunk.len() > 1 {
-            output.push(ALPHABET[((value >> 6) & 0x3f) as usize] as char);
-        } else {
-            output.push('=');
-        }
-        if chunk.len() > 2 {
-            output.push(ALPHABET[(value & 0x3f) as usize] as char);
-        } else {
-            output.push('=');
-        }
-    }
-
-    output
 }
 
 fn styled_rows_to_lines(rows: &[StyledRow], cols: usize) -> Vec<Line<'static>> {
@@ -757,20 +762,32 @@ fn styled_rows_to_lines(rows: &[StyledRow], cols: usize) -> Vec<Line<'static>> {
         .collect()
 }
 
-fn row_background_style(row: &StyledRow) -> Option<TerminalStyle> {
+fn styled_selected_rows_to_lines(
+    rows: &[StyledRow],
+    cols: usize,
+    first_visible_row: usize,
+    selection: VisibleSelection,
+) -> Vec<Line<'static>> {
+    rows.iter()
+        .enumerate()
+        .map(|(index, row)| {
+            let visible_row_index = first_visible_row + index;
+            styled_selected_row_to_line(row, cols, visible_row_index, selection)
+        })
+        .collect()
+}
+
+fn trailing_cell_style(row: &StyledRow) -> Style {
     row.spans
-        .iter()
-        .rev()
-        .find(|span| span.style.background.is_some() || span.style.reverse)
-        .map(|span| span.style.clone())
+        .last()
+        .filter(|span| span.style.background.is_some() || span.style.reverse)
+        .map(|span| ratatui_style(&span.style))
+        .unwrap_or_default()
 }
 
 fn styled_row_to_line(row: &StyledRow, cols: usize) -> Line<'static> {
     let mut width = 0;
-    let line_style = row_background_style(row)
-        .as_ref()
-        .map(ratatui_style)
-        .unwrap_or_default();
+    let line_style = trailing_cell_style(row);
     let mut spans = row
         .spans
         .iter()
@@ -791,6 +808,73 @@ fn styled_row_to_line(row: &StyledRow, cols: usize) -> Line<'static> {
     let mut line = Line::from(spans);
     line.style = line_style;
     line
+}
+
+fn styled_selected_row_to_line(
+    row: &StyledRow,
+    cols: usize,
+    row_index: usize,
+    selection: VisibleSelection,
+) -> Line<'static> {
+    let row_width = row.spans.iter().map(|span| span.text.chars().count()).sum();
+    let Some((start, end)) = selected_row_bounds_for_width(row_width, row_index, selection) else {
+        return styled_row_to_line(row, cols);
+    };
+
+    let line_style = trailing_cell_style(row);
+    let mut spans = Vec::new();
+    let mut offset = 0;
+    for span in &row.spans {
+        let style = ratatui_style(&span.style);
+        push_selected_styled_segments(&mut spans, &span.text, style, offset, start, end);
+        offset += span.text.chars().count();
+    }
+
+    if offset < cols {
+        push_selected_styled_segments(
+            &mut spans,
+            &" ".repeat(cols - offset),
+            trailing_cell_style(row),
+            offset,
+            start,
+            end,
+        );
+    }
+
+    let mut line = Line::from(spans);
+    line.style = line_style;
+    line
+}
+
+fn push_selected_styled_segments(
+    spans: &mut Vec<Span<'static>>,
+    text: &str,
+    style: Style,
+    offset: usize,
+    selection_start: usize,
+    selection_end: usize,
+) {
+    let width = text.chars().count();
+    if width == 0 {
+        return;
+    }
+    let segment_start = offset;
+    let segment_end = offset + width;
+    let selected_start = selection_start.clamp(segment_start, segment_end) - segment_start;
+    let selected_end = selection_end.clamp(segment_start, segment_end) - segment_start;
+
+    if selected_start > 0 {
+        spans.push(Span::styled(slice_chars(text, 0, selected_start), style));
+    }
+    if selected_start < selected_end {
+        spans.push(Span::styled(
+            slice_chars(text, selected_start, selected_end),
+            style.add_modifier(Modifier::REVERSED),
+        ));
+    }
+    if selected_end < width {
+        spans.push(Span::styled(slice_chars(text, selected_end, width), style));
+    }
 }
 
 fn ratatui_style(style: &TerminalStyle) -> Style {
@@ -960,7 +1044,7 @@ fn current_session_size(sidebar_visible: bool) -> Result<SessionSize> {
 }
 
 fn session_size_from_app_terminal(rows: u16, cols: u16, sidebar_visible: bool) -> SessionSize {
-    let horizontal_chrome = if sidebar_visible { 28 } else { 0 };
+    let horizontal_chrome = if sidebar_visible { SIDEBAR_COLS } else { 0 };
     session_size_from_terminal(
         rows.saturating_sub(1),
         cols.saturating_sub(horizontal_chrome),
@@ -1171,6 +1255,33 @@ mod tests {
     }
 
     #[test]
+    fn terminal_selection_middle_rows_stop_at_row_text() {
+        let row_index = 1;
+        let selection = VisibleSelection {
+            start: TerminalPoint { col: 2, row: 0 },
+            end: TerminalPoint { col: 8, row: 2 },
+        };
+
+        assert_eq!(
+            selected_row_bounds("abc", row_index, selection),
+            Some((0, 3))
+        );
+    }
+
+    #[test]
+    fn terminal_selection_is_active_only_after_dragging() {
+        let mut selection = TerminalSelection::new(TerminalPoint { col: 4, row: 2 });
+
+        assert!(!selection.is_active());
+
+        selection.update(TerminalPoint { col: 4, row: 2 });
+        assert!(!selection.is_active());
+
+        selection.update(TerminalPoint { col: 5, row: 2 });
+        assert!(selection.is_active());
+    }
+
+    #[test]
     fn terminal_point_clamps_to_terminal_pane() {
         let area = Rect {
             x: 28,
@@ -1190,12 +1301,6 @@ mod tests {
         .expect("terminal point");
 
         assert_eq!(point, TerminalPoint { col: 0, row: 3 });
-    }
-
-    #[test]
-    fn base64_encoder_pads_terminal_clipboard_payloads() {
-        assert_eq!(base64_encode(b"Argus"), "QXJndXM=");
-        assert_eq!(base64_encode(b"copy"), "Y29weQ==");
     }
 
     #[test]
@@ -1261,6 +1366,73 @@ mod tests {
         assert_eq!(lines[0].spans[0].content.as_ref(), "top");
         assert!(lines[1].spans.is_empty());
         assert_eq!(lines[2].spans[0].content.as_ref(), "bottom");
+    }
+
+    #[test]
+    fn styled_selection_preserves_span_colors() {
+        let red = TerminalColor {
+            red: 200,
+            green: 10,
+            blue: 10,
+        };
+        let blue = TerminalColor {
+            red: 10,
+            green: 40,
+            blue: 220,
+        };
+        let row = StyledRow {
+            spans: vec![
+                StyledSpan {
+                    text: "red".to_string(),
+                    style: TerminalStyle {
+                        foreground: Some(red),
+                        background: Some(TerminalColor {
+                            red: 20,
+                            green: 20,
+                            blue: 20,
+                        }),
+                        ..TerminalStyle::default()
+                    },
+                },
+                StyledSpan {
+                    text: "green".to_string(),
+                    style: TerminalStyle {
+                        foreground: Some(blue),
+                        ..TerminalStyle::default()
+                    },
+                },
+            ],
+        };
+
+        let line = styled_selected_row_to_line(
+            &row,
+            8,
+            0,
+            VisibleSelection {
+                start: TerminalPoint { col: 1, row: 0 },
+                end: TerminalPoint { col: 4, row: 0 },
+            },
+        );
+
+        assert_eq!(line.spans[0].content.as_ref(), "r");
+        assert_eq!(line.spans[1].content.as_ref(), "ed");
+        assert_eq!(line.spans[2].content.as_ref(), "gr");
+        assert_eq!(line.spans[3].content.as_ref(), "een");
+        assert_eq!(line.spans[1].style.fg, Some(ratatui_color(red)));
+        assert!(line.spans[1].style.bg.is_some());
+        assert_eq!(line.spans[2].style.fg, Some(ratatui_color(blue)));
+        assert!(
+            line.spans[1]
+                .style
+                .add_modifier
+                .contains(Modifier::REVERSED)
+        );
+        assert!(
+            line.spans[2]
+                .style
+                .add_modifier
+                .contains(Modifier::REVERSED)
+        );
     }
 
     #[test]

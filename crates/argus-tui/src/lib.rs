@@ -451,10 +451,17 @@ fn replace_snapshot_preserving_scroll(view: &mut SessionView, snapshot: SessionS
     if view.scroll_offset > 0 {
         let previous_rows = view.snapshot.visible_rows.len();
         let next_rows = snapshot.visible_rows.len();
-        view.scroll_offset = view
-            .scroll_offset
-            .saturating_add(next_rows.saturating_sub(previous_rows))
-            .min(next_rows.saturating_sub(1));
+        view.scroll_offset = match next_rows.cmp(&previous_rows) {
+            std::cmp::Ordering::Greater => view
+                .scroll_offset
+                .saturating_add(next_rows - previous_rows)
+                .min(next_rows.saturating_sub(1)),
+            std::cmp::Ordering::Less => view
+                .scroll_offset
+                .saturating_sub(previous_rows - next_rows)
+                .min(next_rows.saturating_sub(1)),
+            std::cmp::Ordering::Equal => view.scroll_offset.min(next_rows.saturating_sub(1)),
+        };
     }
     view.snapshot = snapshot;
 }
@@ -702,6 +709,27 @@ mod tests {
         );
 
         assert_eq!(view.scroll_offset, 0);
+    }
+
+    #[test]
+    fn snapshot_events_shrink_scroll_offset_when_rows_disappear() {
+        let session_id = SessionId::new("session-1").expect("session id");
+        let mut view = test_view(session_id.clone());
+        view.snapshot.visible_rows = vec!["a".into(), "b".into(), "c".into(), "d".into()];
+        view.scroll_offset = 3;
+
+        let mut snapshot = view.snapshot.clone();
+        snapshot.visible_rows = vec!["c".into(), "d".into()];
+
+        apply_event_to_view(
+            &mut view,
+            SessionEvent::Snapshot {
+                session_id,
+                snapshot,
+            },
+        );
+
+        assert_eq!(view.scroll_offset, 1);
     }
 
     #[test]

@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::fs;
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
+#[cfg(unix)]
+use std::os::unix::ffi::OsStringExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -21,7 +23,7 @@ use argus_core::session::{
 };
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use wezterm_term::color::{ColorAttribute, ColorPalette, SrgbaTuple};
-use wezterm_term::{Terminal, TerminalConfiguration, TerminalSize};
+use wezterm_term::{Intensity, Terminal, TerminalConfiguration, TerminalSize, Underline};
 
 const EVENT_SUBSCRIBER_BUFFER: usize = 64;
 const MAX_OSC_BUFFER: usize = 4096;
@@ -843,7 +845,12 @@ impl OutputState {
     }
 
     fn extract_current_working_directory(&mut self, bytes: &[u8]) -> Option<PathBuf> {
-        self.cwd_sequence_buffer.extend_from_slice(bytes);
+        if self.cwd_sequence_buffer.is_empty() {
+            let start = bytes.iter().position(|byte| *byte == 0x1b)?;
+            self.cwd_sequence_buffer.extend_from_slice(&bytes[start..]);
+        } else {
+            self.cwd_sequence_buffer.extend_from_slice(bytes);
+        }
         let mut current_working_directory = None;
 
         while let Some(start) = find_bytes(&self.cwd_sequence_buffer, b"\x1b]7;file://") {
@@ -865,6 +872,12 @@ impl OutputState {
                 terminator + 2
             };
             self.cwd_sequence_buffer.drain(..drain_to);
+        }
+
+        if !self.cwd_sequence_buffer.is_empty()
+            && find_bytes(&self.cwd_sequence_buffer, b"\x1b]7;file://").is_none()
+        {
+            retain_osc_prefix_candidate(&mut self.cwd_sequence_buffer);
         }
 
         if self.cwd_sequence_buffer.len() > MAX_OSC_BUFFER {
@@ -1127,7 +1140,7 @@ fn terminal_cursor(terminal: &Terminal) -> TerminalCursor {
             .saturating_sub(screen.physical_rows)
             + cursor.y.max(0) as usize,
         col: cursor.x,
-        visible: format!("{:?}", cursor.visibility) == "Visible",
+        visible: cursor.visibility == Default::default(),
     }
 }
 
@@ -1135,10 +1148,10 @@ fn terminal_style(attrs: &wezterm_term::CellAttributes, palette: &ColorPalette) 
     TerminalStyle {
         foreground: terminal_color(attrs.foreground(), palette, true),
         background: terminal_color(attrs.background(), palette, false),
-        bold: format!("{:?}", attrs.intensity()) == "Bold",
-        dim: format!("{:?}", attrs.intensity()) == "Half",
+        bold: attrs.intensity() == Intensity::Bold,
+        dim: attrs.intensity() == Intensity::Half,
         italic: attrs.italic(),
-        underline: format!("{:?}", attrs.underline()) != "None",
+        underline: attrs.underline() != Underline::None,
         reverse: attrs.reverse(),
     }
 }
@@ -1187,11 +1200,33 @@ fn find_osc_terminator(bytes: &[u8]) -> Option<usize> {
     None
 }
 
+fn retain_osc_prefix_candidate(buffer: &mut Vec<u8>) {
+    let prefix = b"\x1b]7;file://";
+    let keep = (1..prefix.len())
+        .rev()
+        .find(|len| buffer.ends_with(&prefix[..*len]))
+        .unwrap_or(0);
+    if keep == 0 {
+        buffer.clear();
+    } else if buffer.len() > keep {
+        buffer.drain(..buffer.len() - keep);
+    }
+}
+
 fn cwd_from_osc7_payload(payload: &[u8]) -> Option<PathBuf> {
     let slash = payload.iter().position(|byte| *byte == b'/')?;
     let path_bytes = percent_decode_uri_path(&payload[slash..])?;
-    let path = String::from_utf8_lossy(&path_bytes).into_owned();
-    Some(PathBuf::from(path))
+    path_buf_from_uri_path_bytes(path_bytes)
+}
+
+#[cfg(unix)]
+fn path_buf_from_uri_path_bytes(path_bytes: Vec<u8>) -> Option<PathBuf> {
+    Some(std::ffi::OsString::from_vec(path_bytes).into())
+}
+
+#[cfg(not(unix))]
+fn path_buf_from_uri_path_bytes(path_bytes: Vec<u8>) -> Option<PathBuf> {
+    String::from_utf8(path_bytes).ok().map(PathBuf::from)
 }
 
 fn percent_decode_uri_path(path: &[u8]) -> Option<Vec<u8>> {
@@ -1243,6 +1278,32 @@ mod tests {
     }
 
     #[test]
+    fn output_state_skips_cwd_scan_when_chunk_has_no_escape() {
+        let log_path = unique_log_path();
+        let mut output = test_output_state(&log_path, SessionSize::default());
+
+        let cwd = output
+            .ingest(b"plain output without control bytes")
+            .unwrap();
+
+        assert_eq!(cwd, None);
+        assert!(output.cwd_sequence_buffer.is_empty());
+        let _ = std::fs::remove_file(log_path);
+    }
+
+    #[test]
+    fn output_state_preserves_split_osc7_prefix_candidate() {
+        let log_path = unique_log_path();
+        let mut output = test_output_state(&log_path, SessionSize::default());
+
+        assert!(output.ingest(b"noise\x1b]7;file").unwrap().is_none());
+        let cwd = output.ingest(b"://host/tmp/split\x07").unwrap();
+
+        assert_eq!(cwd, Some(PathBuf::from("/tmp/split")));
+        let _ = std::fs::remove_file(log_path);
+    }
+
+    #[test]
     fn output_state_decodes_osc7_percent_encoded_working_directory() {
         let log_path = unique_log_path();
         let mut output = test_output_state(&log_path, SessionSize::default());
@@ -1252,6 +1313,23 @@ mod tests {
             .unwrap();
 
         assert_eq!(cwd, Some(PathBuf::from("/tmp/a b/#hash%")));
+        let _ = std::fs::remove_file(log_path);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn output_state_preserves_non_utf8_percent_encoded_working_directory() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let log_path = unique_log_path();
+        let mut output = test_output_state(&log_path, SessionSize::default());
+
+        let cwd = output.ingest(b"\x1b]7;file://host/tmp/%FF\x07").unwrap();
+
+        assert_eq!(
+            cwd.as_ref().expect("cwd").as_os_str().as_bytes(),
+            b"/tmp/\xFF"
+        );
         let _ = std::fs::remove_file(log_path);
     }
 

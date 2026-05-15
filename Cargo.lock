@@ -141,6 +141,7 @@ dependencies = [
  "anyhow",
  "argus-core",
  "argus-daemon",
+ "base64",
  "crossterm",
  "ratatui",
  "tracing",

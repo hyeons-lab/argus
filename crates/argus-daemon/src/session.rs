@@ -684,7 +684,7 @@ impl ActorState {
             bytes_logged: self.output.bytes_logged,
             size: self.size.clone(),
             visible_rows: visible_rows(&self.output.terminal),
-            styled_rows_start: styled_rows_start(&self.output.terminal),
+            styled_rows_start: 0,
             styled_rows: styled_visible_rows(&self.output.terminal),
             cursor: terminal_cursor(&self.output.terminal),
             current_working_directory: self.current_working_directory.clone(),
@@ -1123,9 +1123,8 @@ fn visible_rows(terminal: &Terminal) -> Vec<String> {
 fn styled_visible_rows(terminal: &Terminal) -> Vec<StyledRow> {
     let screen = terminal.screen();
     let end = screen.scrollback_rows();
-    let start = styled_rows_start(terminal);
     let palette = ColorPalette::default();
-    let mut lines = screen.lines_in_phys_range(start..end);
+    let mut lines = screen.lines_in_phys_range(0..end);
 
     lines
         .iter_mut()
@@ -1154,13 +1153,6 @@ fn styled_visible_rows(terminal: &Terminal) -> Vec<StyledRow> {
             StyledRow { spans }
         })
         .collect()
-}
-
-fn styled_rows_start(terminal: &Terminal) -> usize {
-    let screen = terminal.screen();
-    screen
-        .scrollback_rows()
-        .saturating_sub(screen.physical_rows)
 }
 
 fn terminal_cursor(terminal: &Terminal) -> TerminalCursor {

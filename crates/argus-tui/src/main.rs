@@ -9,8 +9,8 @@ use argus_core::session::{
 };
 use argus_tui::{LocalSessionApp, SessionView, session_size_from_terminal};
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -243,6 +243,11 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut LocalSession
                 pending_confirmation = None;
                 selection = None;
                 app.resize(session_size_from_app_terminal(rows, cols, sidebar_visible));
+            }
+            Event::Paste(text) => {
+                pending_confirmation = None;
+                selection = None;
+                app.write_input(text.into_bytes());
             }
             Event::Mouse(mouse) => {
                 if handle_mouse_event(
@@ -963,7 +968,12 @@ impl TerminalSession {
     fn enter() -> Result<Self> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+        execute!(
+            stdout,
+            EnterAlternateScreen,
+            EnableMouseCapture,
+            EnableBracketedPaste
+        )?;
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
         terminal.clear()?;
@@ -982,6 +992,7 @@ impl TerminalSession {
         disable_raw_mode()?;
         execute!(
             self.terminal.backend_mut(),
+            DisableBracketedPaste,
             DisableMouseCapture,
             LeaveAlternateScreen
         )?;
@@ -1237,7 +1248,7 @@ mod tests {
     }
 
     #[test]
-    fn styled_rows_are_selected_by_snapshot_anchor() {
+    fn styled_rows_are_selected_from_full_snapshot_range() {
         let snapshot = argus_core::session::SessionSnapshot {
             output_seq: 0,
             bytes_logged: 0,
@@ -1247,8 +1258,14 @@ mod tests {
                 "visible-1".to_string(),
                 "visible-2".to_string(),
             ],
-            styled_rows_start: 1,
+            styled_rows_start: 0,
             styled_rows: vec![
+                StyledRow {
+                    spans: vec![StyledSpan {
+                        text: "history".to_string(),
+                        style: TerminalStyle::default(),
+                    }],
+                },
                 StyledRow {
                     spans: vec![StyledSpan {
                         text: "visible-1".to_string(),
@@ -1271,8 +1288,8 @@ mod tests {
             exited: false,
         };
 
+        assert!(styled_rows_for_visible_range(&snapshot, 0, 2).is_some());
         assert!(styled_rows_for_visible_range(&snapshot, 1, 3).is_some());
-        assert!(styled_rows_for_visible_range(&snapshot, 0, 2).is_none());
     }
 
     #[test]

@@ -16,6 +16,8 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, fmt};
 
+const DEFAULT_FILTER: &str = "info,wezterm_term::terminalstate::performer=warn,tattoy_wezterm_term::terminalstate::performer=warn";
+
 pub struct Config {
     pub log_file: PathBuf,
     pub console: bool,
@@ -29,8 +31,8 @@ pub fn default_config() -> Result<Config> {
     Ok(Config {
         log_file,
         console: io::stderr().is_terminal(),
-        file_filter: "info".to_string(),
-        console_filter: "info".to_string(),
+        file_filter: DEFAULT_FILTER.to_string(),
+        console_filter: DEFAULT_FILTER.to_string(),
     })
 }
 
@@ -78,4 +80,16 @@ pub fn init(config: Config) -> Result<WorkerGuard> {
         .context("initializing tracing subscriber")?;
 
     Ok(guard)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_filters_suppress_terminal_bell_info_logs() {
+        assert!(DEFAULT_FILTER.contains("wezterm_term::terminalstate::performer=warn"));
+        assert!(DEFAULT_FILTER.contains("tattoy_wezterm_term::terminalstate::performer=warn"));
+        EnvFilter::try_new(DEFAULT_FILTER).expect("valid default filter");
+    }
 }

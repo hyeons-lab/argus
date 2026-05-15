@@ -4,16 +4,18 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use argus_core::session::{InputControllerKind, SessionSize};
+use argus_core::session::{
+    InputControllerKind, SessionSize, StyledRow, TerminalColor, TerminalCursor, TerminalStyle,
+};
 use argus_tui::{LocalSessionApp, SessionView, session_size_from_terminal};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
@@ -149,52 +151,100 @@ fn display_os_str(value: &OsStr) -> String {
 }
 
 fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut LocalSessionApp) -> Result<()> {
+    let mut sidebar_visible = true;
+    let mut pending_confirmation = None;
+
     loop {
         app.drain_events();
-        terminal.draw(|frame| draw(frame, app))?;
+        terminal.draw(|frame| draw(frame, app, sidebar_visible, pending_confirmation))?;
 
         if !event::poll(Duration::from_millis(50))? {
             continue;
         }
 
         match event::read()? {
-            Event::Key(key) if should_exit(key) => return Ok(()),
+            Event::Key(key) if key.kind != KeyEventKind::Press => {}
+            Event::Key(key) if should_exit(key) => {
+                if app.exits_by_shutting_down_sessions() {
+                    if pending_confirmation == Some(Confirmation::Exit) {
+                        return Ok(());
+                    }
+                    pending_confirmation = Some(Confirmation::Exit);
+                    continue;
+                }
+                return Ok(());
+            }
             Event::Key(key) => match key_to_command(key) {
                 Some(AppCommand::New) => {
-                    app.create_session(current_session_size()?);
+                    pending_confirmation = None;
+                    app.create_session(current_session_size(sidebar_visible)?);
                 }
                 Some(AppCommand::Close) => {
+                    if pending_confirmation != Some(Confirmation::CloseSession) {
+                        pending_confirmation = Some(Confirmation::CloseSession);
+                        continue;
+                    }
+                    pending_confirmation = None;
                     app.close_selected_session();
                 }
-                Some(AppCommand::Next) => app.select_next_session(),
-                Some(AppCommand::Previous) => app.select_previous_session(),
+                Some(AppCommand::Next) => {
+                    pending_confirmation = None;
+                    app.select_next_session();
+                }
+                Some(AppCommand::Previous) => {
+                    pending_confirmation = None;
+                    app.select_previous_session();
+                }
+                Some(AppCommand::ToggleSidebar) => {
+                    pending_confirmation = None;
+                    sidebar_visible = !sidebar_visible;
+                    app.resize(current_session_size(sidebar_visible)?);
+                }
                 None => {
+                    pending_confirmation = None;
                     if let Some(bytes) = key_to_input(key) {
                         app.write_input(bytes);
                     }
                 }
             },
             Event::Resize(cols, rows) => {
-                app.resize(session_size_from_app_terminal(rows, cols));
+                pending_confirmation = None;
+                app.resize(session_size_from_app_terminal(rows, cols, sidebar_visible));
             }
             _ => {}
         }
     }
 }
 
-fn draw(frame: &mut ratatui::Frame<'_>, app: &LocalSessionApp) {
+fn draw(
+    frame: &mut ratatui::Frame<'_>,
+    app: &LocalSessionApp,
+    sidebar_visible: bool,
+    pending_confirmation: Option<Confirmation>,
+) {
     let root = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(1), Constraint::Length(1)])
         .split(frame.area());
-    let body = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(28), Constraint::Min(20)])
-        .split(root[0]);
 
-    draw_sidebar(frame, body[0], app);
-    draw_terminal(frame, body[1], app.view());
-    draw_status(frame, root[1], app.view(), app.last_error());
+    if sidebar_visible {
+        let body = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(28), Constraint::Min(20)])
+            .split(root[0]);
+        draw_sidebar(frame, body[0], app);
+        draw_terminal(frame, body[1], app.view());
+    } else {
+        draw_terminal(frame, root[0], app.view());
+    }
+
+    draw_status(
+        frame,
+        root[1],
+        app.view(),
+        app.last_error(),
+        pending_confirmation,
+    );
 }
 
 fn draw_sidebar(frame: &mut ratatui::Frame<'_>, area: Rect, app: &LocalSessionApp) {
@@ -256,17 +306,118 @@ fn draw_terminal(frame: &mut ratatui::Frame<'_>, area: Rect, view: &SessionView)
         .visible_rows
         .len()
         .saturating_sub(visible_height);
-    let rows = view.snapshot.visible_rows[start..]
-        .iter()
-        .map(|row| Line::from(row.as_str()))
-        .collect::<Vec<_>>();
+    let render_cols = terminal_render_cols(area, view.snapshot.size.cols);
+    let rows = if view.snapshot.styled_rows.len() == view.snapshot.visible_rows.len() {
+        styled_rows_to_lines(&view.snapshot.styled_rows[start..], render_cols)
+    } else {
+        view.snapshot.visible_rows[start..]
+            .iter()
+            .map(|row| Line::from(row.as_str()))
+            .collect::<Vec<_>>()
+    };
 
     frame.render_widget(
-        Paragraph::new(rows)
-            .block(Block::default().title("Terminal").borders(Borders::ALL))
-            .wrap(Wrap { trim: false }),
+        Paragraph::new(rows).block(Block::default().title("Terminal").borders(Borders::ALL)),
         area,
     );
+    if let Some(position) = terminal_cursor_position(area, start, &view.snapshot.cursor) {
+        frame.set_cursor_position(position);
+    }
+}
+
+fn terminal_render_cols(area: Rect, _snapshot_cols: usize) -> usize {
+    usize::from(area.width.saturating_sub(2))
+}
+
+fn terminal_cursor_position(
+    area: Rect,
+    start_row: usize,
+    cursor: &TerminalCursor,
+) -> Option<Position> {
+    if !cursor.visible || cursor.row < start_row {
+        return None;
+    }
+
+    let inner_width = usize::from(area.width.saturating_sub(2));
+    let inner_height = usize::from(area.height.saturating_sub(2));
+    let row = cursor.row - start_row;
+    if cursor.col >= inner_width || row >= inner_height {
+        return None;
+    }
+
+    Some(Position::new(
+        area.x + 1 + u16::try_from(cursor.col).ok()?,
+        area.y + 1 + u16::try_from(row).ok()?,
+    ))
+}
+
+fn styled_rows_to_lines(rows: &[StyledRow], cols: usize) -> Vec<Line<'static>> {
+    rows.iter()
+        .map(|row| styled_row_to_line(row, cols))
+        .collect()
+}
+
+fn row_background_style(row: &StyledRow) -> Option<TerminalStyle> {
+    row.spans
+        .iter()
+        .rev()
+        .find(|span| span.style.background.is_some() || span.style.reverse)
+        .map(|span| span.style.clone())
+}
+
+fn styled_row_to_line(row: &StyledRow, cols: usize) -> Line<'static> {
+    let mut width = 0;
+    let line_style = row_background_style(row)
+        .as_ref()
+        .map(ratatui_style)
+        .unwrap_or_default();
+    let mut spans = row
+        .spans
+        .iter()
+        .map(|span| {
+            width += span.text.chars().count();
+            Span::styled(span.text.clone(), ratatui_style(&span.style))
+        })
+        .collect::<Vec<_>>();
+    if let Some(last_span) = row.spans.last()
+        && (last_span.style.background.is_some() || last_span.style.reverse)
+        && width < cols
+    {
+        spans.push(Span::styled(
+            " ".repeat(cols - width),
+            ratatui_style(&last_span.style),
+        ));
+    }
+    let mut line = Line::from(spans);
+    line.style = line_style;
+    line
+}
+
+fn ratatui_style(style: &TerminalStyle) -> Style {
+    let mut output = Style::default();
+    if let Some(color) = style.foreground {
+        output = output.fg(ratatui_color(color));
+    }
+    if let Some(color) = style.background {
+        output = output.bg(ratatui_color(color));
+    }
+    if style.bold {
+        output = output.add_modifier(Modifier::BOLD);
+    }
+    if style.italic {
+        output = output.add_modifier(Modifier::ITALIC);
+    }
+    if style.underline {
+        output = output.add_modifier(Modifier::UNDERLINED);
+    }
+    if style.reverse {
+        output = output.add_modifier(Modifier::REVERSED);
+    }
+    output
+}
+
+fn ratatui_color(color: TerminalColor) -> Color {
+    Color::Rgb(color.red, color.green, color.blue)
 }
 
 fn draw_status(
@@ -274,19 +425,42 @@ fn draw_status(
     area: Rect,
     view: &SessionView,
     last_error: Option<&str>,
+    pending_confirmation: Option<Confirmation>,
 ) {
     let status = if let Some(error) = last_error {
         Line::from(vec![
             Span::styled("error ", Style::default().fg(Color::Red)),
             Span::raw(error),
         ])
+    } else if let Some(confirmation) = pending_confirmation {
+        Line::from(Span::styled(
+            confirmation.message(),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ))
     } else {
         Line::from(format!(
-            "seq {}  bytes {}  Ctrl-N new  Ctrl-W close  Alt-arrows switch  Esc/Ctrl-Q exit",
+            "seq {}  bytes {}  Ctrl-N new  Ctrl-W close  F2 tabs  Alt-arrows switch  Ctrl-Q exit",
             view.snapshot.output_seq, view.snapshot.bytes_logged
         ))
     };
     frame.render_widget(Paragraph::new(status), area);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Confirmation {
+    CloseSession,
+    Exit,
+}
+
+impl Confirmation {
+    fn message(self) -> &'static str {
+        match self {
+            Confirmation::CloseSession => "press Ctrl-W again to close this terminal",
+            Confirmation::Exit => "press Ctrl-Q again to exit and close all embedded terminals",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -295,6 +469,7 @@ enum AppCommand {
     Close,
     Next,
     Previous,
+    ToggleSidebar,
 }
 
 fn key_to_command(key: KeyEvent) -> Option<AppCommand> {
@@ -315,14 +490,14 @@ fn key_to_command(key: KeyEvent) -> Option<AppCommand> {
         KeyCode::Up | KeyCode::Left if key.modifiers.contains(KeyModifiers::ALT) => {
             Some(AppCommand::Previous)
         }
+        KeyCode::F(2) => Some(AppCommand::ToggleSidebar),
         _ => None,
     }
 }
 
 fn should_exit(key: KeyEvent) -> bool {
-    matches!(key.code, KeyCode::Esc)
-        || (key.modifiers.contains(KeyModifiers::CONTROL)
-            && matches!(key.code, KeyCode::Char('q') | KeyCode::Char('Q')))
+    key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('q') | KeyCode::Char('Q'))
 }
 
 fn key_to_input(key: KeyEvent) -> Option<Vec<u8>> {
@@ -341,6 +516,7 @@ fn key_to_input(key: KeyEvent) -> Option<Vec<u8>> {
         KeyCode::Home => Some(b"\x1b[H".to_vec()),
         KeyCode::End => Some(b"\x1b[F".to_vec()),
         KeyCode::Delete => Some(b"\x1b[3~".to_vec()),
+        KeyCode::Esc => Some(b"\x1b".to_vec()),
         _ => None,
     }
 }
@@ -355,16 +531,20 @@ fn control_byte(character: char) -> Option<u8> {
 }
 
 fn initial_session_size() -> Result<SessionSize> {
-    current_session_size()
+    current_session_size(true)
 }
 
-fn current_session_size() -> Result<SessionSize> {
+fn current_session_size(sidebar_visible: bool) -> Result<SessionSize> {
     let (cols, rows) = crossterm::terminal::size()?;
-    Ok(session_size_from_app_terminal(rows, cols))
+    Ok(session_size_from_app_terminal(rows, cols, sidebar_visible))
 }
 
-fn session_size_from_app_terminal(rows: u16, cols: u16) -> SessionSize {
-    session_size_from_terminal(rows.saturating_sub(3), cols.saturating_sub(30))
+fn session_size_from_app_terminal(rows: u16, cols: u16, sidebar_visible: bool) -> SessionSize {
+    let horizontal_chrome = if sidebar_visible { 30 } else { 2 };
+    session_size_from_terminal(
+        rows.saturating_sub(3),
+        cols.saturating_sub(horizontal_chrome),
+    )
 }
 
 struct TerminalSession {
@@ -409,6 +589,7 @@ impl Drop for TerminalSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use argus_core::session::{StyledSpan, TerminalStyle};
 
     #[test]
     fn printable_keys_are_forwarded_to_session() {
@@ -420,11 +601,18 @@ mod tests {
             key_to_input(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             Some(b"\r".to_vec())
         );
+        assert_eq!(
+            key_to_input(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            Some(b"\x1b".to_vec())
+        );
     }
 
     #[test]
-    fn local_exit_uses_escape_or_control_q() {
-        assert!(should_exit(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+    fn local_exit_uses_control_q() {
+        assert!(!should_exit(KeyEvent::new(
+            KeyCode::Esc,
+            KeyModifiers::NONE
+        )));
         assert!(should_exit(KeyEvent::new(
             KeyCode::Char('q'),
             KeyModifiers::CONTROL,
@@ -454,6 +642,10 @@ mod tests {
             Some(AppCommand::Previous)
         );
         assert_eq!(
+            key_to_command(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE)),
+            Some(AppCommand::ToggleSidebar)
+        );
+        assert_eq!(
             key_to_command(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
             None
         );
@@ -461,10 +653,110 @@ mod tests {
 
     #[test]
     fn session_size_matches_terminal_pane_inner_area() {
-        let size = session_size_from_app_terminal(24, 100);
+        let size = session_size_from_app_terminal(24, 100, true);
 
         assert_eq!(size.rows, 21);
         assert_eq!(size.cols, 70);
+    }
+
+    #[test]
+    fn session_size_expands_when_sidebar_is_hidden() {
+        let size = session_size_from_app_terminal(24, 100, false);
+
+        assert_eq!(size.rows, 21);
+        assert_eq!(size.cols, 98);
+    }
+
+    #[test]
+    fn terminal_render_cols_expands_to_terminal_pane_width() {
+        let area = Rect::new(0, 0, 102, 24);
+
+        assert_eq!(terminal_render_cols(area, 80), 100);
+    }
+
+    #[test]
+    fn terminal_render_cols_uses_terminal_pane_width_when_snapshot_is_wider() {
+        let area = Rect::new(0, 0, 72, 24);
+
+        assert_eq!(terminal_render_cols(area, 100), 70);
+    }
+
+    #[test]
+    fn styled_row_pads_trailing_background_to_session_width() {
+        let row = StyledRow {
+            spans: vec![StyledSpan {
+                text: "input".to_string(),
+                style: TerminalStyle {
+                    background: Some(TerminalColor {
+                        red: 10,
+                        green: 20,
+                        blue: 30,
+                    }),
+                    ..TerminalStyle::default()
+                },
+            }],
+        };
+
+        let line = styled_row_to_line(&row, 8);
+
+        assert_eq!(line.width(), 8);
+        assert!(line.style.bg.is_some());
+        assert_eq!(line.spans.len(), 2);
+        assert_eq!(line.spans[1].content.as_ref(), "   ");
+        assert!(line.spans[1].style.bg.is_some());
+    }
+
+    #[test]
+    fn styled_rows_preserve_blank_rows() {
+        let rows = vec![
+            StyledRow {
+                spans: vec![StyledSpan {
+                    text: "top".to_string(),
+                    style: TerminalStyle::default(),
+                }],
+            },
+            StyledRow { spans: Vec::new() },
+            StyledRow {
+                spans: vec![StyledSpan {
+                    text: "bottom".to_string(),
+                    style: TerminalStyle::default(),
+                }],
+            },
+        ];
+
+        let lines = styled_rows_to_lines(&rows, 8);
+
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0].spans[0].content.as_ref(), "top");
+        assert!(lines[1].spans.is_empty());
+        assert_eq!(lines[2].spans[0].content.as_ref(), "bottom");
+    }
+
+    #[test]
+    fn terminal_cursor_position_maps_visible_screen_to_terminal_area() {
+        let area = Rect::new(10, 5, 82, 24);
+        let cursor = TerminalCursor {
+            row: 20,
+            col: 7,
+            visible: true,
+        };
+
+        assert_eq!(
+            terminal_cursor_position(area, 3, &cursor),
+            Some(Position::new(18, 23))
+        );
+    }
+
+    #[test]
+    fn terminal_cursor_position_hides_out_of_view_cursor() {
+        let area = Rect::new(0, 0, 82, 24);
+        let cursor = TerminalCursor {
+            row: 2,
+            col: 7,
+            visible: true,
+        };
+
+        assert_eq!(terminal_cursor_position(area, 3, &cursor), None);
     }
 
     #[test]

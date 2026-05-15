@@ -106,6 +106,13 @@ pub fn default_socket_path() -> PathBuf {
 }
 
 impl SessionApi for UnixSocketClient {
+    fn list_sessions(&self) -> Result<Vec<SessionId>> {
+        match self.round_trip(WireRequest::ListSessions)? {
+            WireSuccess::SessionIds(session_ids) => Ok(session_ids),
+            other => bail!("unexpected list_sessions response: {other:?}"),
+        }
+    }
+
     fn start_session(&self, request: StartSessionRequest) -> Result<SessionId> {
         match self.round_trip(WireRequest::StartSession(request))? {
             WireSuccess::SessionId(session_id) => Ok(session_id),
@@ -219,6 +226,7 @@ impl SessionApi for UnixSocketClient {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum WireRequest {
+    ListSessions,
     StartSession(StartSessionRequest),
     AttachSession(AttachSessionRequest),
     SubscribeSessionEvents {
@@ -266,6 +274,7 @@ impl WireResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum WireSuccess {
     Unit,
+    SessionIds(Vec<SessionId>),
     SessionId(SessionId),
     AttachSession(AttachSessionResponse),
     LeaseChange(LeaseChange),
@@ -404,6 +413,7 @@ fn handle_subscription(
 
 fn handle_request(manager: &SessionManager, request: WireRequest) -> Result<WireSuccess> {
     match request {
+        WireRequest::ListSessions => manager.list_sessions().map(WireSuccess::SessionIds),
         WireRequest::StartSession(request) => {
             manager.start_session(request).map(WireSuccess::SessionId)
         }
@@ -507,6 +517,12 @@ mod tests {
         request.args = vec!["-lc".to_string(), "cat".to_string()];
         request.size = SessionSize::default();
         let session_id = client.start_session(request).expect("start session");
+        assert!(
+            client
+                .list_sessions()
+                .expect("list sessions")
+                .contains(&session_id)
+        );
         let events = client
             .subscribe_session_events(session_id.clone())
             .expect("subscribe events");

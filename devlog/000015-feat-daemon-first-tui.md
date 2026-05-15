@@ -16,10 +16,26 @@
 - Added explicit `--embedded` and `--socket <path>` startup options with parser coverage.
 - Marked the local Unix socket adapter complete in the design roadmap.
 - Fixed PR review follow-ups so `--help` exits successfully, non-Unix TUI startup defaults to embedded mode as the supported workaround, and both ambiguous `--embedded`/`--socket` orderings are covered.
+- Added daemon snapshot cwd metadata and styled rows, made `Ctrl-N` start a new session from the selected session cwd, and rendered styled terminal spans in the TUI.
+- Preserved background-styled blank cells from terminal clear-to-end sequences so Codex's grey composer/input rows survive daemon snapshots.
+- Added an `F2` TUI sidebar toggle and resized the active session when the sidebar is hidden or restored.
+- Made daemon-mode TUI exit detach without shutting down sessions and added repeat-key confirmation for destructive closes.
+- Forwarded terminal-emulator responses back into the PTY so child TUIs can query default foreground/background colors.
+- Added daemon session listing and TUI reattach-on-start so existing daemon sessions show up after restarting the TUI.
+- Filled blank styled rows between matching background rows to avoid black gaps inside Codex's grey input box.
+- Collapsed blank separator rows between matching background-styled rows so Codex's grey input box does not render an extra empty line.
+- Padded styled terminal rows to the rendered TUI pane width so background-colored input rows do not stop at the daemon snapshot width.
+- Forwarded `Esc` to the child terminal and kept `Ctrl-Q` as the Argus exit shortcut so child TUIs can consume Escape first.
+- Collapsed blank separator rows even when the separator row carries a different background, as long as the surrounding nonblank rows share the same background.
+- Compared only background/reverse attributes when collapsing blank separator rows so foreground differences do not keep Codex's grey input row split.
+- Disabled Ratatui paragraph wrapping for terminal output and padded rows only to the visible pane width so stale/wider snapshots cannot wrap into an extra full-width row.
+- Removed blank-row deletion from TUI projection, forwarded only key press events to child terminals, and carried terminal cursor coordinates through snapshots so child TUI input stays in place.
+- Suppressed default info-level `wezterm_term` bell logs so child BEL output does not leak "Ding!" diagnostics into Argus terminal sessions.
 
 ## Commits
 - 472806b — feat: make TUI daemon-first
-- HEAD — fix: clean up TUI startup options
+- 1c53b54 — fix: clean up TUI startup options
+- HEAD — fix: preserve TUI session cwd and styles
 
 ## Progress
 - 2026-05-14T18:00-0700 — Created `feat/daemon-first-tui` worktree from `origin/main`, unset the accidental upstream, and inspected the current TUI socket fallback.
@@ -28,3 +44,21 @@
 - 2026-05-14T18:18-0700 — Addressed PR review feedback: clean help exit, Windows/non-Unix embedded default workaround, and extra parser coverage for reverse ambiguous option ordering.
 - 2026-05-14T18:18-0700 — Validation passed after review fixes: `cargo run -q -p argus-tui -- --help`, `cargo fmt --all -- --check`, `cargo check --workspace`, `cargo test -p argus-tui`, `/home/dberrios/.cargo/bin/cargo test --workspace`, `cargo clippy --all-targets --all-features -- -D warnings`, and `git diff --check`.
 - 2026-05-14T18:25-0700 — Fixed the Windows CI regression by making the default-startup parser test assert the platform-specific default: daemon socket on Unix and embedded mode on non-Unix.
+- 2026-05-14T18:48-0700 — Added selected-session cwd inheritance for new TUI tabs and styled terminal-row rendering so colorized sessions are not flattened to plain text.
+- 2026-05-14T18:48-0700 — Validation passed for the follow-up: `cargo check --workspace`, `/home/dberrios/.cargo/bin/cargo test --workspace` with escalated Unix socket permissions, `cargo clippy --all-targets --all-features -- -D warnings`, and `git diff --check`.
+- 2026-05-14T18:59-0700 — Preserved trailing styled cells so full-row backgrounds and prompt input boxes keep their background color instead of being trimmed to text width.
+- 2026-05-14T19:04-0700 — Padded TUI styled rows with the trailing background/reverse style to the session width so Codex input boxes keep their background even when the terminal model does not materialize every trailing cell.
+- 2026-05-14T19:08-0700 — Applied the trailing background/reverse style to the Ratatui line itself so row backgrounds are painted across the full terminal row, not only under explicit spans.
+- 2026-05-14T19:16-0700 — Inspected OpenAI Codex's TUI renderer and matched its background-colored clear-to-end output by snapshotting physical terminal cells, including styled blanks.
+- 2026-05-14T19:17-0700 — Added an `F2` sidebar toggle so the terminal pane can reclaim the session-list columns on narrow screens.
+- 2026-05-14T19:22-0700 — Split daemon-mode exit from session shutdown and added confirmation for destructive terminal close/embedded exit.
+- 2026-05-14T19:31-0700 — Fixed dropped terminal query responses; Codex needs OSC 10/11 default-color replies before it chooses the grey composer background.
+- 2026-05-14T19:40-0700 — Filled blank rows between matching background-styled rows so Codex's grey input box is not split by a black row.
+- 2026-05-14T19:43-0700 — Added session listing through the daemon API and made daemon-backed TUI startup reattach existing sessions instead of always starting a new one.
+- 2026-05-14T19:50-0700 — Collapsed matching blank separator rows instead of painting them, removing the extra empty line inside Codex's grey input area.
+- 2026-05-14T19:57-0700 — Padded styled rows to the TUI pane width as well as the daemon snapshot width, addressing a remaining right-side gap in Codex's grey input row.
+- 2026-05-14T19:59-0700 — Forwarded Escape to child terminals, updated the exit hint to `Ctrl-Q`, and relaxed blank separator collapse to handle a differently styled gap row between matching grey input rows.
+- 2026-05-14T20:02-0700 — Made blank separator collapse compare background/reverse only, so differing foreground/cursor attributes above and below the gap do not prevent removal.
+- 2026-05-14T20:06-0700 — Disabled outer paragraph wrapping for the terminal pane and made styled row padding use the visible pane width, preventing over-wide snapshots from rendering as extra full-width visual rows.
+- 2026-05-14T22:09-0700 — Reverted blank-row collapse to preserve terminal geometry, filtered non-press key events to avoid duplicate child input, and added cursor position metadata from the daemon terminal model to the TUI renderer.
+- 2026-05-14T22:15-0700 — Raised the default log filter for `wezterm_term::terminalstate::performer` bell diagnostics to warn, keeping BEL events out of default daemon console/file logs.

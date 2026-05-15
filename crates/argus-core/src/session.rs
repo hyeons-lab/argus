@@ -102,7 +102,45 @@ pub struct SessionSnapshot {
     pub bytes_logged: u64,
     pub size: SessionSize,
     pub visible_rows: Vec<String>,
+    pub styled_rows: Vec<StyledRow>,
+    pub cursor: TerminalCursor,
+    pub current_working_directory: Option<PathBuf>,
     pub exited: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalCursor {
+    pub row: usize,
+    pub col: usize,
+    pub visible: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StyledRow {
+    pub spans: Vec<StyledSpan>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StyledSpan {
+    pub text: String,
+    pub style: TerminalStyle,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalStyle {
+    pub foreground: Option<TerminalColor>,
+    pub background: Option<TerminalColor>,
+    pub bold: bool,
+    pub italic: bool,
+    pub underline: bool,
+    pub reverse: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalColor {
+    pub red: u8,
+    pub green: u8,
+    pub blue: u8,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -298,6 +336,7 @@ pub enum SessionEvent {
 pub type SessionEventReceiver = Receiver<SessionEvent>;
 
 pub trait SessionApi {
+    fn list_sessions(&self) -> Result<Vec<SessionId>>;
     fn start_session(&self, request: StartSessionRequest) -> Result<SessionId>;
     fn attach_session(&self, request: AttachSessionRequest) -> Result<AttachSessionResponse>;
     fn subscribe_session_events(&self, session_id: SessionId) -> Result<SessionEventReceiver>;

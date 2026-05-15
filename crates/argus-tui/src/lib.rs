@@ -24,6 +24,7 @@ pub struct SessionView {
 pub struct LocalSessionApp {
     manager: Box<dyn SessionApi>,
     client_id: ClientId,
+    owns_sessions: bool,
     sessions: Vec<SessionRuntime>,
     selected: usize,
     last_error: Option<String>,
@@ -42,29 +43,48 @@ impl LocalSessionApp {
     #[cfg(unix)]
     pub fn connect(socket_path: impl Into<PathBuf>, size: SessionSize) -> Result<Self> {
         let manager = UnixSocketClient::new(socket_path);
-        Self::start_with_manager(Box::new(manager), size)
+        Self::start_with_manager(Box::new(manager), size, false)
     }
 
     fn start_with_log_dir(size: SessionSize, log_dir: PathBuf) -> Result<Self> {
         let manager = SessionManager::new(SessionManagerConfig::new(log_dir));
-        Self::start_with_manager(Box::new(manager), size)
+        Self::start_with_manager(Box::new(manager), size, true)
     }
 
-    fn start_with_manager(manager: Box<dyn SessionApi>, size: SessionSize) -> Result<Self> {
+    fn start_with_manager(
+        manager: Box<dyn SessionApi>,
+        size: SessionSize,
+        owns_sessions: bool,
+    ) -> Result<Self> {
         let client_id = ClientId::new("local-tui")?;
-        let session = start_local_session(manager.as_ref(), &client_id, size)?;
+        let mut sessions = if owns_sessions {
+            Vec::new()
+        } else {
+            attach_existing_sessions(manager.as_ref(), &client_id, size.clone())?
+        };
+
+        if sessions.is_empty() {
+            sessions.push(start_local_session(
+                manager.as_ref(),
+                &client_id,
+                size,
+                std::env::current_dir().ok(),
+            )?);
+        }
 
         Ok(Self {
             manager,
             client_id,
-            sessions: vec![session],
+            owns_sessions,
+            sessions,
             selected: 0,
             last_error: None,
         })
     }
 
     pub fn create_session(&mut self, size: SessionSize) {
-        match start_local_session(self.manager.as_ref(), &self.client_id, size) {
+        let cwd = self.view().snapshot.current_working_directory.clone();
+        match start_local_session(self.manager.as_ref(), &self.client_id, size, cwd) {
             Ok(session) => {
                 self.sessions.push(session);
                 self.selected = self.sessions.len() - 1;
@@ -128,6 +148,10 @@ impl LocalSessionApp {
 
     pub fn last_error(&self) -> Option<&str> {
         self.last_error.as_deref()
+    }
+
+    pub fn exits_by_shutting_down_sessions(&self) -> bool {
+        self.owns_sessions
     }
 
     pub fn drain_events(&mut self) {
@@ -214,6 +238,15 @@ impl LocalSessionApp {
     }
 
     pub fn shutdown(self) -> Result<Vec<CompletedSession>> {
+        if !self.owns_sessions {
+            for session in self.sessions {
+                let _ = self
+                    .manager
+                    .release_input_lease(session.view.session_id, self.client_id.clone());
+            }
+            return Ok(Vec::new());
+        }
+
         let mut completed_sessions = Vec::new();
         let mut result = Ok(());
 
@@ -230,13 +263,62 @@ impl LocalSessionApp {
     }
 }
 
+fn attach_existing_sessions(
+    manager: &dyn SessionApi,
+    client_id: &ClientId,
+    size: SessionSize,
+) -> Result<Vec<SessionRuntime>> {
+    let mut sessions = Vec::new();
+
+    for session_id in manager.list_sessions()? {
+        let mut session = attach_existing_session(manager, client_id, session_id)?;
+        if !session.view.snapshot.exited && session.view.snapshot.size != size {
+            match manager.resize_session(ResizeSessionRequest {
+                session_id: session.view.session_id.clone(),
+                size: size.clone(),
+            }) {
+                Ok(snapshot) => session.view.snapshot = snapshot,
+                Err(error) => tracing::warn!(error = ?error, "failed to resize reattached session"),
+            }
+        }
+        sessions.push(session);
+    }
+
+    Ok(sessions)
+}
+
+fn attach_existing_session(
+    manager: &dyn SessionApi,
+    client_id: &ClientId,
+    session_id: SessionId,
+) -> Result<SessionRuntime> {
+    let events = manager.subscribe_session_events(session_id.clone())?;
+    let attached = manager.attach_session(AttachSessionRequest {
+        session_id: session_id.clone(),
+        client_id: client_id.clone(),
+        mode: AttachMode::InteractiveController,
+    })?;
+
+    Ok(SessionRuntime {
+        events,
+        view: SessionView {
+            session_id,
+            snapshot: attached.snapshot,
+            lease: attached.lease,
+            last_completed: None,
+        },
+    })
+}
+
 fn start_local_session(
     manager: &dyn SessionApi,
     client_id: &ClientId,
     size: SessionSize,
+    cwd: Option<PathBuf>,
 ) -> Result<SessionRuntime> {
     let mut request = default_shell_request();
     request.size = size;
+    request.cwd = cwd;
 
     let session_id = manager.start_session(request)?;
     let events = match manager.subscribe_session_events(session_id.clone()) {
@@ -333,7 +415,8 @@ fn default_shell_request() -> StartSessionRequest {
     let mut request = StartSessionRequest::new("/bin/sh");
     request.args = vec![
         "-lc".to_string(),
-        "stty sane echo; exec \"${SHELL:-/bin/sh}\"".to_string(),
+        "stty sane echo; export PROMPT_COMMAND='printf \"\\033]7;file://%s%s\\033\\\\\" \"${HOSTNAME:-localhost}\" \"$PWD\"'; exec \"${SHELL:-/bin/sh}\""
+            .to_string(),
     ];
     request
 }
@@ -341,9 +424,12 @@ fn default_shell_request() -> StartSessionRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use argus_core::session::TerminalCursor;
     use argus_core::session::{
-        InputControllerKind, InputLeaseHolder, LeaseChange, LeaseChangeAction,
+        AttachSessionResponse, InputControllerKind, InputLeaseHolder, InputLeaseRequest,
+        LeaseChange, LeaseChangeAction, ResizeSessionRequest, StartSessionRequest,
     };
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
     #[test]
@@ -502,12 +588,14 @@ mod tests {
         let mut app = LocalSessionApp::start_with_log_dir(SessionSize::default(), log_dir.clone())
             .expect("start local session app");
         let first_session = app.view().session_id.clone();
+        let first_cwd = app.view().snapshot.current_working_directory.clone();
 
         app.create_session(SessionSize::default());
 
         assert_eq!(app.sessions().len(), 2);
         assert_eq!(app.selected_index(), 1);
         assert_ne!(app.view().session_id, first_session);
+        assert_eq!(app.view().snapshot.current_working_directory, first_cwd);
 
         app.select_previous_session();
         assert_eq!(app.selected_index(), 0);
@@ -524,6 +612,49 @@ mod tests {
         let _ = std::fs::remove_dir_all(log_dir);
     }
 
+    #[test]
+    fn daemon_backed_app_detaches_without_shutting_down_sessions() {
+        let counts = Arc::new(Mutex::new(RecordingCounts::default()));
+        let app = LocalSessionApp::start_with_manager(
+            Box::new(RecordingSessionApi {
+                counts: counts.clone(),
+                session_ids: Vec::new(),
+            }),
+            SessionSize::default(),
+            false,
+        )
+        .expect("start daemon-backed app");
+
+        assert!(!app.exits_by_shutting_down_sessions());
+        app.shutdown().expect("detach daemon-backed app");
+
+        let counts = counts.lock().expect("counts lock");
+        assert_eq!(counts.releases, 1);
+        assert_eq!(counts.shutdowns, 0);
+    }
+
+    #[test]
+    fn daemon_backed_app_reattaches_existing_sessions_before_starting_new_one() {
+        let counts = Arc::new(Mutex::new(RecordingCounts::default()));
+        let app = LocalSessionApp::start_with_manager(
+            Box::new(RecordingSessionApi {
+                counts: counts.clone(),
+                session_ids: vec![
+                    SessionId::new("session-7").expect("session id"),
+                    SessionId::new("session-8").expect("session id"),
+                ],
+            }),
+            SessionSize::default(),
+            false,
+        )
+        .expect("start daemon-backed app");
+
+        assert_eq!(app.sessions().len(), 2);
+        assert_eq!(app.selected_index(), 0);
+        assert_eq!(app.view().session_id, SessionId::new("session-7").unwrap());
+        assert_eq!(counts.lock().expect("counts lock").starts, 0);
+    }
+
     fn test_view(session_id: SessionId) -> SessionView {
         SessionView {
             session_id,
@@ -532,6 +663,13 @@ mod tests {
                 bytes_logged: 0,
                 size: SessionSize::default(),
                 visible_rows: Vec::new(),
+                styled_rows: Vec::new(),
+                cursor: TerminalCursor {
+                    row: 0,
+                    col: 0,
+                    visible: true,
+                },
+                current_working_directory: None,
                 exited: false,
             },
             lease: InputLeaseState::default(),
@@ -545,5 +683,98 @@ mod tests {
             std::process::id(),
             std::thread::current().id()
         ))
+    }
+
+    #[derive(Default)]
+    struct RecordingCounts {
+        starts: usize,
+        releases: usize,
+        shutdowns: usize,
+    }
+
+    struct RecordingSessionApi {
+        counts: Arc<Mutex<RecordingCounts>>,
+        session_ids: Vec<SessionId>,
+    }
+
+    impl SessionApi for RecordingSessionApi {
+        fn list_sessions(&self) -> Result<Vec<SessionId>> {
+            Ok(self.session_ids.clone())
+        }
+
+        fn start_session(&self, _request: StartSessionRequest) -> Result<SessionId> {
+            self.counts.lock().expect("counts lock").starts += 1;
+            SessionId::new("session-1")
+        }
+
+        fn attach_session(&self, request: AttachSessionRequest) -> Result<AttachSessionResponse> {
+            Ok(AttachSessionResponse {
+                snapshot: SessionSnapshot {
+                    output_seq: 0,
+                    bytes_logged: 0,
+                    size: SessionSize::default(),
+                    visible_rows: Vec::new(),
+                    styled_rows: Vec::new(),
+                    cursor: TerminalCursor {
+                        row: 0,
+                        col: 0,
+                        visible: true,
+                    },
+                    current_working_directory: None,
+                    exited: false,
+                },
+                lease: InputLeaseState {
+                    holder: request.mode.controller_kind().map(|kind| InputLeaseHolder {
+                        client_id: request.client_id,
+                        kind,
+                    }),
+                    generation: 1,
+                },
+            })
+        }
+
+        fn subscribe_session_events(&self, _session_id: SessionId) -> Result<SessionEventReceiver> {
+            let (_tx, rx) = std::sync::mpsc::channel();
+            Ok(rx)
+        }
+
+        fn acquire_input_lease(&self, _request: InputLeaseRequest) -> Result<LeaseChange> {
+            unreachable!("test does not acquire leases")
+        }
+
+        fn release_input_lease(
+            &self,
+            _session_id: SessionId,
+            _client_id: ClientId,
+        ) -> Result<LeaseChange> {
+            self.counts.lock().expect("counts lock").releases += 1;
+            Ok(LeaseChange {
+                generation: 2,
+                previous: None,
+                current: None,
+                action: LeaseChangeAction::Released,
+            })
+        }
+
+        fn write_input(&self, _request: WriteInputRequest) -> Result<()> {
+            unreachable!("test does not write input")
+        }
+
+        fn resize_session(&self, _request: ResizeSessionRequest) -> Result<SessionSnapshot> {
+            unreachable!("test does not resize sessions")
+        }
+
+        fn snapshot_session(&self, _session_id: SessionId) -> Result<SessionSnapshot> {
+            unreachable!("test does not snapshot sessions")
+        }
+
+        fn shutdown_session(&self, _session_id: SessionId) -> Result<CompletedSession> {
+            self.counts.lock().expect("counts lock").shutdowns += 1;
+            Ok(CompletedSession {
+                output_seq: 0,
+                bytes_logged: 0,
+                visible_rows: Vec::new(),
+            })
+        }
     }
 }

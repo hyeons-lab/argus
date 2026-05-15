@@ -1,7 +1,9 @@
+use std::ffi::{OsStr, OsString};
 use std::io::{self, Stdout};
+use std::path::PathBuf;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use argus_core::session::{InputControllerKind, SessionSize};
 use argus_tui::{LocalSessionApp, SessionView, session_size_from_terminal};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
@@ -38,20 +40,92 @@ fn main() -> Result<()> {
 
 #[cfg(unix)]
 fn start_app(size: SessionSize) -> Result<LocalSessionApp> {
-    let socket_path = argus_daemon::ipc::default_socket_path();
-    LocalSessionApp::connect(&socket_path, size.clone()).or_else(|socket_error| {
-        tracing::warn!(
-            socket_path = %socket_path.display(),
-            error = ?socket_error,
-            "falling back to embedded local session manager"
-        );
-        LocalSessionApp::start(size)
-    })
+    match StartupMode::from_args(std::env::args_os().skip(1))? {
+        StartupMode::Daemon { socket_path } => LocalSessionApp::connect(&socket_path, size)
+            .with_context(|| {
+                format!(
+                    "connecting to Argus daemon socket at {}; start argus-daemon or pass --embedded for development mode",
+                    socket_path.display()
+                )
+            }),
+        StartupMode::Embedded => {
+            tracing::warn!("starting embedded local session manager");
+            LocalSessionApp::start(size)
+        }
+    }
 }
 
 #[cfg(not(unix))]
 fn start_app(size: SessionSize) -> Result<LocalSessionApp> {
-    LocalSessionApp::start(size)
+    match StartupMode::from_args(std::env::args_os().skip(1))? {
+        StartupMode::Daemon { .. } => {
+            bail!(
+                "daemon socket mode is only available on Unix; pass --embedded for development mode"
+            )
+        }
+        StartupMode::Embedded => LocalSessionApp::start(size),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StartupMode {
+    Daemon { socket_path: PathBuf },
+    Embedded,
+}
+
+impl StartupMode {
+    fn from_args(args: impl IntoIterator<Item = OsString>) -> Result<Self> {
+        let mut mode = None;
+        let mut socket_path = None;
+        let mut args = args.into_iter();
+
+        while let Some(arg) = args.next() {
+            match arg.to_str() {
+                Some("--embedded") => {
+                    if mode.replace(StartupMode::Embedded).is_some() {
+                        bail!("--embedded can only be passed once");
+                    }
+                }
+                Some("--socket") => {
+                    if socket_path.is_some() {
+                        bail!("--socket can only be passed once");
+                    }
+                    let Some(path) = args.next() else {
+                        bail!("--socket requires a path");
+                    };
+                    socket_path = Some(PathBuf::from(path));
+                }
+                Some("--help") | Some("-h") => bail!(
+                    "usage: argus-tui [--socket <path>] [--embedded]\n\nBy default argus-tui connects to the daemon Unix socket. Use --embedded only for isolated development."
+                ),
+                Some(flag) if flag.starts_with('-') => bail!("unknown option {flag}"),
+                Some(value) => bail!("unexpected argument {value}"),
+                None => bail!("argument is not valid UTF-8: {}", display_os_str(&arg)),
+            }
+        }
+
+        if mode == Some(StartupMode::Embedded) && socket_path.is_some() {
+            bail!("--embedded cannot be combined with --socket");
+        }
+
+        Ok(mode.unwrap_or_else(|| StartupMode::Daemon {
+            socket_path: socket_path.unwrap_or_else(default_socket_path),
+        }))
+    }
+}
+
+#[cfg(unix)]
+fn default_socket_path() -> PathBuf {
+    argus_daemon::ipc::default_socket_path()
+}
+
+#[cfg(not(unix))]
+fn default_socket_path() -> PathBuf {
+    PathBuf::from("argus.sock")
+}
+
+fn display_os_str(value: &OsStr) -> String {
+    value.to_string_lossy().into_owned()
 }
 
 fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut LocalSessionApp) -> Result<()> {
@@ -371,5 +445,47 @@ mod tests {
 
         assert_eq!(size.rows, 21);
         assert_eq!(size.cols, 70);
+    }
+
+    #[test]
+    fn startup_mode_defaults_to_daemon_socket() {
+        assert!(matches!(
+            StartupMode::from_args(Vec::<OsString>::new()).expect("startup mode"),
+            StartupMode::Daemon { .. }
+        ));
+    }
+
+    #[test]
+    fn startup_mode_accepts_explicit_socket() {
+        assert_eq!(
+            StartupMode::from_args([
+                OsString::from("--socket"),
+                OsString::from("/tmp/argus.sock")
+            ])
+            .expect("startup mode"),
+            StartupMode::Daemon {
+                socket_path: PathBuf::from("/tmp/argus.sock")
+            }
+        );
+    }
+
+    #[test]
+    fn startup_mode_accepts_explicit_embedded_mode() {
+        assert_eq!(
+            StartupMode::from_args([OsString::from("--embedded")]).expect("startup mode"),
+            StartupMode::Embedded
+        );
+    }
+
+    #[test]
+    fn startup_mode_rejects_ambiguous_mode() {
+        let error = StartupMode::from_args([
+            OsString::from("--embedded"),
+            OsString::from("--socket"),
+            OsString::from("/tmp/argus.sock"),
+        ])
+        .expect_err("ambiguous mode should fail");
+
+        assert!(error.to_string().contains("--embedded cannot be combined"));
     }
 }

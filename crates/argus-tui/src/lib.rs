@@ -209,7 +209,7 @@ impl LocalSessionApp {
                 }
             }
 
-            if refresh_snapshot && !session.view.snapshot.exited {
+            if refresh_snapshot {
                 let session_id = session.view.session_id.clone();
                 match self.manager.snapshot_session(session_id) {
                     Ok(snapshot) => replace_snapshot_preserving_scroll(&mut session.view, snapshot),
@@ -441,7 +441,7 @@ pub fn apply_event_to_view(view: &mut SessionView, event: SessionEvent) -> bool 
             view.snapshot.styled_rows.clear();
             view.snapshot.exited = true;
             view.last_completed = Some(completed);
-            false
+            true
         }
         _ => false,
     }
@@ -550,7 +550,7 @@ mod tests {
         let mut view = test_view(session_id.clone());
         view.snapshot.styled_rows = vec![argus_core::session::StyledRow { spans: Vec::new() }];
 
-        apply_event_to_view(
+        assert!(apply_event_to_view(
             &mut view,
             SessionEvent::Exited {
                 session_id,
@@ -560,13 +560,74 @@ mod tests {
                     visible_rows: vec!["done".to_string()],
                 },
             },
-        );
+        ));
 
         assert!(view.snapshot.exited);
         assert_eq!(view.snapshot.output_seq, 3);
         assert_eq!(view.snapshot.visible_rows, ["done"]);
         assert!(view.snapshot.styled_rows.is_empty());
         assert!(view.last_completed.is_some());
+    }
+
+    #[test]
+    fn exited_events_refresh_final_styled_snapshot() {
+        let session_id = SessionId::new("session-7").expect("session id");
+        let (event_tx, event_rx) = std::sync::mpsc::channel();
+        event_tx
+            .send(SessionEvent::Exited {
+                session_id: session_id.clone(),
+                completed: CompletedSession {
+                    output_seq: 4,
+                    bytes_logged: 9,
+                    visible_rows: vec!["red".to_string()],
+                },
+            })
+            .expect("queue exit event");
+        drop(event_tx);
+
+        let final_snapshot = SessionSnapshot {
+            output_seq: 4,
+            bytes_logged: 9,
+            size: SessionSize::default(),
+            visible_rows: vec!["red".to_string()],
+            styled_rows_start: 0,
+            styled_rows: vec![argus_core::session::StyledRow {
+                spans: vec![argus_core::session::StyledSpan {
+                    text: "red".to_string(),
+                    style: argus_core::session::TerminalStyle {
+                        foreground: Some(argus_core::session::TerminalColor {
+                            red: 255,
+                            green: 0,
+                            blue: 0,
+                        }),
+                        ..Default::default()
+                    },
+                }],
+            }],
+            cursor: TerminalCursor {
+                row: 0,
+                col: 0,
+                visible: false,
+            },
+            current_working_directory: None,
+            exited: true,
+        };
+
+        let mut app = LocalSessionApp::start_with_manager(
+            Box::new(ExitSnapshotSessionApi {
+                session_id: session_id.clone(),
+                event_rx: Mutex::new(Some(event_rx)),
+                final_snapshot: final_snapshot.clone(),
+            }),
+            SessionSize::default(),
+            false,
+        )
+        .expect("start daemon-backed app");
+
+        app.drain_events();
+
+        assert!(app.view().snapshot.exited);
+        assert_eq!(app.view().snapshot.styled_rows, final_snapshot.styled_rows);
     }
 
     #[test]
@@ -891,6 +952,12 @@ mod tests {
         session_ids: Vec<SessionId>,
     }
 
+    struct ExitSnapshotSessionApi {
+        session_id: SessionId,
+        event_rx: Mutex<Option<SessionEventReceiver>>,
+        final_snapshot: SessionSnapshot,
+    }
+
     impl SessionApi for RecordingSessionApi {
         fn list_sessions(&self) -> Result<Vec<SessionId>> {
             Ok(self.session_ids.clone())
@@ -979,6 +1046,92 @@ mod tests {
                 bytes_logged: 0,
                 visible_rows: Vec::new(),
             })
+        }
+    }
+
+    impl SessionApi for ExitSnapshotSessionApi {
+        fn list_sessions(&self) -> Result<Vec<SessionId>> {
+            Ok(vec![self.session_id.clone()])
+        }
+
+        fn start_session(&self, _request: StartSessionRequest) -> Result<SessionId> {
+            unreachable!("test attaches an existing session")
+        }
+
+        fn attach_session(&self, request: AttachSessionRequest) -> Result<AttachSessionResponse> {
+            Ok(AttachSessionResponse {
+                snapshot: SessionSnapshot {
+                    output_seq: 0,
+                    bytes_logged: 0,
+                    size: SessionSize::default(),
+                    visible_rows: Vec::new(),
+                    styled_rows_start: 0,
+                    styled_rows: Vec::new(),
+                    cursor: TerminalCursor {
+                        row: 0,
+                        col: 0,
+                        visible: true,
+                    },
+                    current_working_directory: None,
+                    exited: false,
+                },
+                lease: InputLeaseState {
+                    holder: request.mode.controller_kind().map(|kind| InputLeaseHolder {
+                        client_id: request.client_id,
+                        kind,
+                    }),
+                    generation: 1,
+                },
+            })
+        }
+
+        fn subscribe_session_events(&self, _session_id: SessionId) -> Result<SessionEventReceiver> {
+            self.event_rx
+                .lock()
+                .expect("event receiver lock")
+                .take()
+                .ok_or_else(|| anyhow::anyhow!("event receiver already taken"))
+        }
+
+        fn acquire_input_lease(&self, request: InputLeaseRequest) -> Result<LeaseChange> {
+            Ok(LeaseChange {
+                generation: 2,
+                previous: None,
+                current: Some(InputLeaseHolder {
+                    client_id: request.client_id,
+                    kind: request.kind,
+                }),
+                action: LeaseChangeAction::Acquired,
+            })
+        }
+
+        fn release_input_lease(
+            &self,
+            _session_id: SessionId,
+            _client_id: ClientId,
+        ) -> Result<LeaseChange> {
+            Ok(LeaseChange {
+                generation: 2,
+                previous: None,
+                current: None,
+                action: LeaseChangeAction::Released,
+            })
+        }
+
+        fn write_input(&self, _request: WriteInputRequest) -> Result<()> {
+            unreachable!("test does not write input")
+        }
+
+        fn resize_session(&self, _request: ResizeSessionRequest) -> Result<SessionSnapshot> {
+            unreachable!("test does not resize sessions")
+        }
+
+        fn snapshot_session(&self, _session_id: SessionId) -> Result<SessionSnapshot> {
+            Ok(self.final_snapshot.clone())
+        }
+
+        fn shutdown_session(&self, _session_id: SessionId) -> Result<CompletedSession> {
+            unreachable!("test does not shut down sessions")
         }
     }
 }

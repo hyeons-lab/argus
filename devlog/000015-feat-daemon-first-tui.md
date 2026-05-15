@@ -48,6 +48,9 @@
 - Preserved the visible scrollback anchor when new daemon snapshots append rows while the TUI is scrolled back; views at the bottom still follow new output.
 - Enabled bracketed paste mode and forwarded paste payloads as a single input write so pasted text appears in the child terminal without per-character animation.
 - Restored styled snapshots for the full retained terminal row set so background and foreground colors render in both live output and scrollback.
+- Restored raw PTY line-feed handling in the daemon terminal model and wrapped outer Crossterm paste events with bracketed paste markers before forwarding them to child applications.
+- Decoded percent-escaped OSC 7 file URI paths before storing daemon session cwd metadata.
+- Refreshed a final styled daemon snapshot after exit events so live TUI views keep terminal colors the same way reattached views do.
 
 ## Commits
 - 472806b — feat: make TUI daemon-first
@@ -56,7 +59,8 @@
 - d93e7fc — fix: restore TUI mouse wheel scrollback
 - bf8d127 — fix: satisfy daemon IPC clippy lint
 - abfe7b9 — fix: polish terminal selection and rendering
-- HEAD — fix: restore paste and color behavior
+- f41bb6e — fix: restore paste and color behavior
+- HEAD — fix: preserve exited session colors
 
 ## Progress
 - 2026-05-14T18:00-0700 — Created `feat/daemon-first-tui` worktree from `origin/main`, unset the accidental upstream, and inspected the current TUI socket fallback.
@@ -110,3 +114,7 @@
 - 2026-05-15T08:59-0700 — Enabled Crossterm bracketed paste handling so paste events are forwarded to the selected session as one byte buffer instead of a sequence of key events.
 - 2026-05-15T09:01-0700 — Restored full-range styled terminal snapshots after the live-viewport style optimization dropped colors from scrollback and other rows outside the narrowed style anchor.
 - 2026-05-15T09:01-0700 — Validation passed: `cargo fmt --all -- --check`, `/home/dberrios/.cargo/bin/cargo test -p argus-tui`, `/home/dberrios/.cargo/bin/cargo test -p argus-daemon`, `cargo clippy -p argus-core -p argus-daemon -p argus-tui --all-targets --all-features --locked -- -D warnings`, and `git diff --check`.
+- 2026-05-15T11:48-0700 — Addressed review findings by removing daemon-side bare-LF normalization before `wezterm_term` ingestion and forwarding TUI paste events with `ESC[200~`/`ESC[201~` delimiters.
+- 2026-05-15T11:58-0700 — Addressed review feedback by decoding percent-escaped OSC 7 cwd file URI paths before reusing them for daemon session cwd metadata.
+- 2026-05-15T11:59-0700 — Validation passed: `cargo fmt --all -- --check`, `/home/dberrios/.cargo/bin/cargo test -p argus-daemon`, `cargo clippy -p argus-daemon --all-targets --all-features --locked -- -D warnings`, and `git diff --check`.
+- 2026-05-15T12:10-0700 — Fixed live exited-session rendering by treating `SessionEvent::Exited` as a final snapshot refresh trigger, preserving styled terminal rows after the shell exits.

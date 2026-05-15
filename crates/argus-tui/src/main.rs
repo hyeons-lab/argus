@@ -247,7 +247,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut LocalSession
             Event::Paste(text) => {
                 pending_confirmation = None;
                 selection = None;
-                app.write_input(text.into_bytes());
+                app.write_input(bracketed_paste_input(&text));
             }
             Event::Mouse(mouse) => {
                 if handle_mouse_event(
@@ -933,6 +933,14 @@ fn key_to_input(key: KeyEvent) -> Option<Vec<u8>> {
     }
 }
 
+fn bracketed_paste_input(text: &str) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(b"\x1b[200~".len() + text.len() + b"\x1b[201~".len());
+    bytes.extend_from_slice(b"\x1b[200~");
+    bytes.extend_from_slice(text.as_bytes());
+    bytes.extend_from_slice(b"\x1b[201~");
+    bytes
+}
+
 fn control_byte(character: char) -> Option<u8> {
     let upper = character.to_ascii_uppercase();
     if upper.is_ascii_alphabetic() {
@@ -1094,6 +1102,14 @@ mod tests {
         assert_eq!(
             key_to_command(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
             None
+        );
+    }
+
+    #[test]
+    fn paste_input_preserves_bracketed_paste_boundaries() {
+        assert_eq!(
+            bracketed_paste_input("echo one\necho two"),
+            b"\x1b[200~echo one\necho two\x1b[201~"
         );
     }
 

@@ -1,4 +1,3 @@
-use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs;
 use std::fs::{File, OpenOptions};
@@ -504,7 +503,6 @@ struct OutputState {
     log: File,
     terminal: Terminal,
     cwd_sequence_buffer: Vec<u8>,
-    last_terminal_input_byte: Option<u8>,
     bytes_logged: u64,
     output_seq: u64,
 }
@@ -840,10 +838,7 @@ impl OutputState {
         self.bytes_logged += bytes.len() as u64;
         self.output_seq += 1;
         let current_working_directory = self.extract_current_working_directory(bytes);
-        let (terminal_bytes, last_terminal_input_byte) =
-            normalize_bare_line_feeds(bytes, self.last_terminal_input_byte);
-        self.last_terminal_input_byte = last_terminal_input_byte;
-        self.terminal.advance_bytes(&terminal_bytes);
+        self.terminal.advance_bytes(bytes);
         Ok(current_working_directory)
     }
 
@@ -933,7 +928,6 @@ fn spawn_pty_runtime(config: SessionConfig) -> Result<PtyRuntime> {
             log,
             terminal,
             cwd_sequence_buffer: Vec::new(),
-            last_terminal_input_byte: None,
             bytes_logged: 0,
             output_seq: 0,
         },
@@ -1045,37 +1039,6 @@ fn join_thread_with_timeout(handle: JoinHandle<()>, name: &'static str) {
 
 fn shared_pty_writer(writer: Box<dyn Write + Send>) -> SharedPtyWriter {
     Arc::new(Mutex::new(writer))
-}
-
-fn normalize_bare_line_feeds(
-    bytes: &[u8],
-    previous_byte: Option<u8>,
-) -> (Cow<'_, [u8]>, Option<u8>) {
-    let last_byte = bytes.last().copied().or(previous_byte);
-    if !bytes.iter().enumerate().any(|(index, byte)| {
-        *byte == b'\n'
-            && if index == 0 {
-                previous_byte != Some(b'\r')
-            } else {
-                bytes[index - 1] != b'\r'
-            }
-    }) {
-        return (Cow::Borrowed(bytes), last_byte);
-    }
-
-    let mut normalized = Vec::with_capacity(bytes.len());
-    for (index, byte) in bytes.iter().enumerate() {
-        let previous = if index == 0 {
-            previous_byte
-        } else {
-            Some(bytes[index - 1])
-        };
-        if *byte == b'\n' && previous != Some(b'\r') {
-            normalized.push(b'\r');
-        }
-        normalized.push(*byte);
-    }
-    (Cow::Owned(normalized), last_byte)
 }
 
 struct TerminalOutputSink {
@@ -1226,8 +1189,35 @@ fn find_osc_terminator(bytes: &[u8]) -> Option<usize> {
 
 fn cwd_from_osc7_payload(payload: &[u8]) -> Option<PathBuf> {
     let slash = payload.iter().position(|byte| *byte == b'/')?;
-    let path = String::from_utf8_lossy(&payload[slash..]).into_owned();
+    let path_bytes = percent_decode_uri_path(&payload[slash..])?;
+    let path = String::from_utf8_lossy(&path_bytes).into_owned();
     Some(PathBuf::from(path))
+}
+
+fn percent_decode_uri_path(path: &[u8]) -> Option<Vec<u8>> {
+    let mut decoded = Vec::with_capacity(path.len());
+    let mut index = 0;
+    while index < path.len() {
+        if path[index] == b'%' {
+            let high = hex_value(*path.get(index + 1)?)?;
+            let low = hex_value(*path.get(index + 2)?)?;
+            decoded.push((high << 4) | low);
+            index += 3;
+        } else {
+            decoded.push(path[index]);
+            index += 1;
+        }
+    }
+    Some(decoded)
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -1249,6 +1239,30 @@ mod tests {
         let cwd = output.ingest(b"us\x1b\\").unwrap();
 
         assert_eq!(cwd, Some(PathBuf::from("/tmp/argus")));
+        let _ = std::fs::remove_file(log_path);
+    }
+
+    #[test]
+    fn output_state_decodes_osc7_percent_encoded_working_directory() {
+        let log_path = unique_log_path();
+        let mut output = test_output_state(&log_path, SessionSize::default());
+
+        let cwd = output
+            .ingest(b"\x1b]7;file://host/tmp/a%20b/%23hash%25\x07")
+            .unwrap();
+
+        assert_eq!(cwd, Some(PathBuf::from("/tmp/a b/#hash%")));
+        let _ = std::fs::remove_file(log_path);
+    }
+
+    #[test]
+    fn output_state_ignores_malformed_osc7_percent_encoding() {
+        let log_path = unique_log_path();
+        let mut output = test_output_state(&log_path, SessionSize::default());
+
+        let cwd = output.ingest(b"\x1b]7;file://host/tmp/a%2x\x07").unwrap();
+
+        assert_eq!(cwd, None);
         let _ = std::fs::remove_file(log_path);
     }
 
@@ -1338,7 +1352,7 @@ mod tests {
     }
 
     #[test]
-    fn visible_rows_treat_bare_line_feeds_as_new_lines() {
+    fn visible_rows_preserve_raw_bare_line_feed_columns() {
         let log_path = unique_log_path();
         let mut output = test_output_state(
             &log_path,
@@ -1357,23 +1371,12 @@ mod tests {
         let rows = visible_rows(&output.terminal);
 
         assert!(rows.iter().any(|row| row == "Nodes: 330"));
-        assert!(rows.iter().any(|row| row == "Edges: 2400"));
-        assert!(rows.iter().any(|row| row == "Files: 8"));
+        assert!(rows.iter().any(|row| row == "          Edges: 2400"));
+        assert!(
+            rows.iter()
+                .any(|row| row == "                     Files: 8")
+        );
         let _ = std::fs::remove_file(log_path);
-    }
-
-    #[test]
-    fn bare_line_feed_normalization_handles_split_crlf() {
-        assert_eq!(
-            normalize_bare_line_feeds(b"\nFiles", Some(b'\r'))
-                .0
-                .as_ref(),
-            b"\nFiles"
-        );
-        assert_eq!(
-            normalize_bare_line_feeds(b"\nFiles", None).0.as_ref(),
-            b"\r\nFiles"
-        );
     }
 
     #[test]
@@ -1914,7 +1917,6 @@ mod tests {
                 Box::new(TerminalOutputSink { writer }),
             ),
             cwd_sequence_buffer: Vec::new(),
-            last_terminal_input_byte: None,
             bytes_logged: 0,
             output_seq: 0,
         }

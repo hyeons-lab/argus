@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
@@ -18,14 +18,16 @@ use anyhow::{Context, Result, anyhow, ensure};
 use argus_core::session::{
     AttachSessionRequest, AttachSessionResponse, ClientId, CompletedSession, InputLeaseRequest,
     InputLeaseState, LeaseChange, ResizeSessionRequest, SessionApi, SessionEvent,
-    SessionEventReceiver, SessionId, SessionSize, SessionSnapshot, StartSessionRequest, StyledRow,
-    StyledSpan, TerminalColor, TerminalCursor, TerminalStyle, WriteInputRequest,
+    SessionEventEnvelope, SessionEventReceiver, SessionId, SessionSize, SessionSnapshot,
+    StartSessionRequest, StyledRow, StyledRowsRequest, StyledRowsResponse, StyledSpan,
+    SubscribeSessionEventsRequest, TerminalColor, TerminalCursor, TerminalStyle, WriteInputRequest,
 };
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use wezterm_term::color::{ColorAttribute, ColorPalette, SrgbaTuple};
 use wezterm_term::{Intensity, Terminal, TerminalConfiguration, TerminalSize, Underline};
 
 const EVENT_SUBSCRIBER_BUFFER: usize = 64;
+const EVENT_REPLAY_BUFFER: usize = 1024;
 const MAX_OSC_BUFFER: usize = 4096;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -190,11 +192,21 @@ impl SessionApi for SessionManager {
     }
 
     fn subscribe_session_events(&self, session_id: SessionId) -> Result<SessionEventReceiver> {
+        self.subscribe_session_events_from(SubscribeSessionEventsRequest {
+            session_id,
+            after_event_seq: None,
+        })
+    }
+
+    fn subscribe_session_events_from(
+        &self,
+        request: SubscribeSessionEventsRequest,
+    ) -> Result<SessionEventReceiver> {
         let sessions = self.sessions()?;
         let session = sessions
-            .get(&session_id)
-            .with_context(|| format!("session {session_id} not found"))?;
-        session.actor.subscribe_events()
+            .get(&request.session_id)
+            .with_context(|| format!("session {} not found", request.session_id))?;
+        session.actor.subscribe_events(request.after_event_seq)
     }
 
     fn acquire_input_lease(&self, request: InputLeaseRequest) -> Result<LeaseChange> {
@@ -262,6 +274,14 @@ impl SessionApi for SessionManager {
             .get(&session_id)
             .with_context(|| format!("session {session_id} not found"))?;
         session.actor.snapshot()
+    }
+
+    fn styled_rows(&self, request: StyledRowsRequest) -> Result<StyledRowsResponse> {
+        let sessions = self.sessions()?;
+        let session = sessions
+            .get(&request.session_id)
+            .with_context(|| format!("session {} not found", request.session_id))?;
+        session.actor.styled_rows(request.start, request.end)
     }
 
     fn shutdown_session(&self, session_id: SessionId) -> Result<CompletedSession> {
@@ -381,6 +401,8 @@ impl SessionActor {
                     current_working_directory: initial_working_directory,
                     event_session_id,
                     subscribers: Vec::new(),
+                    event_log: VecDeque::new(),
+                    next_event_seq: 1,
                 };
                 run_actor(state, command_rx, output_rx);
             })
@@ -393,10 +415,13 @@ impl SessionActor {
         })
     }
 
-    pub fn subscribe_events(&self) -> Result<SessionEventReceiver> {
+    pub fn subscribe_events(&self, after_event_seq: Option<u64>) -> Result<SessionEventReceiver> {
         let (tx, rx) = mpsc::channel();
         self.tx
-            .send(ActorCommand::SubscribeEvents { response: tx })
+            .send(ActorCommand::SubscribeEvents {
+                after_event_seq,
+                response: tx,
+            })
             .context("sending session event subscription command")?;
         recv_actor_result(rx, "subscribing to session events")
     }
@@ -437,6 +462,18 @@ impl SessionActor {
             .send(ActorCommand::Snapshot { response: tx })
             .context("sending session snapshot command")?;
         recv_actor_result(rx, "reading session snapshot")
+    }
+
+    pub fn styled_rows(&self, start: usize, end: usize) -> Result<StyledRowsResponse> {
+        let (tx, rx) = mpsc::channel();
+        self.tx
+            .send(ActorCommand::StyledRows {
+                start,
+                end,
+                response: tx,
+            })
+            .context("sending session styled row command")?;
+        recv_actor_result(rx, "reading session styled rows")
     }
 
     pub fn shutdown(mut self) -> Result<CompletedSession> {
@@ -489,7 +526,14 @@ struct ActorState {
     exit_broadcasted: bool,
     current_working_directory: Option<PathBuf>,
     event_session_id: Option<SessionId>,
-    subscribers: Vec<SyncSender<SessionEvent>>,
+    subscribers: Vec<EventSubscriber>,
+    event_log: VecDeque<SessionEventEnvelope>,
+    next_event_seq: u64,
+}
+
+struct EventSubscriber {
+    tx: SyncSender<SessionEventEnvelope>,
+    next_event_seq: u64,
 }
 
 struct PtyRuntime {
@@ -526,7 +570,13 @@ enum ActorCommand {
     Snapshot {
         response: Sender<ActorResult<SessionSnapshot>>,
     },
+    StyledRows {
+        start: usize,
+        end: usize,
+        response: Sender<ActorResult<StyledRowsResponse>>,
+    },
     SubscribeEvents {
+        after_event_seq: Option<u64>,
         response: Sender<ActorResult<SessionEventReceiver>>,
     },
     BroadcastEvent {
@@ -557,6 +607,7 @@ fn run_actor(
                 Err(RecvTimeoutError::Timeout) => {
                     state.reap_child();
                     state.broadcast_exit();
+                    state.flush_subscribers();
                 }
                 Err(RecvTimeoutError::Disconnected) => break,
             }
@@ -576,11 +627,12 @@ fn run_actor(
 
         match output_rx.recv_timeout(Duration::from_millis(20)) {
             Ok(message) => state.handle_output(message),
-            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Timeout) => state.flush_subscribers(),
             Err(RecvTimeoutError::Disconnected) => {
                 state.output_closed = true;
                 state.mark_exited();
                 state.broadcast_exit();
+                state.flush_subscribers();
             }
         }
     }
@@ -634,8 +686,19 @@ impl ActorState {
                 let _ = response.send(Ok(self.snapshot()));
                 false
             }
-            ActorCommand::SubscribeEvents { response } => {
-                let _ = response.send(self.subscribe_events());
+            ActorCommand::StyledRows {
+                start,
+                end,
+                response,
+            } => {
+                let _ = response.send(self.styled_rows(start, end));
+                false
+            }
+            ActorCommand::SubscribeEvents {
+                after_event_seq,
+                response,
+            } => {
+                let _ = response.send(self.subscribe_events(after_event_seq));
                 false
             }
             ActorCommand::BroadcastEvent { event, response } => {
@@ -679,17 +742,38 @@ impl ActorState {
     }
 
     fn snapshot(&self) -> SessionSnapshot {
+        let visible_rows = visible_rows(&self.output.terminal);
+        let styled_rows_start = visible_rows.len().saturating_sub(self.size.rows);
         SessionSnapshot {
             output_seq: self.output.output_seq,
             bytes_logged: self.output.bytes_logged,
             size: self.size.clone(),
-            visible_rows: visible_rows(&self.output.terminal),
-            styled_rows_start: 0,
-            styled_rows: styled_visible_rows(&self.output.terminal),
+            styled_rows: styled_visible_rows_for_range(
+                &self.output.terminal,
+                styled_rows_start,
+                visible_rows.len(),
+            ),
+            styled_rows_start,
+            visible_rows,
             cursor: terminal_cursor(&self.output.terminal),
             current_working_directory: self.current_working_directory.clone(),
+            bracketed_paste_enabled: self.output.terminal.bracketed_paste_enabled(),
             exited: self.exited,
         }
+    }
+
+    fn styled_rows(&self, start: usize, end: usize) -> Result<StyledRowsResponse> {
+        ensure!(start <= end, "styled row start must be before end");
+        let row_count = self.output.terminal.screen().scrollback_rows();
+        ensure!(
+            end <= row_count,
+            "styled row range {start}..{end} exceeds retained row count {row_count}"
+        );
+        Ok(StyledRowsResponse {
+            output_seq: self.output.output_seq,
+            start,
+            rows: styled_visible_rows_for_range(&self.output.terminal, start, end),
+        })
     }
 
     fn shutdown(
@@ -714,22 +798,100 @@ impl ActorState {
         Ok(completed)
     }
 
-    fn subscribe_events(&mut self) -> Result<SessionEventReceiver> {
+    fn subscribe_events(&mut self, after_event_seq: Option<u64>) -> Result<SessionEventReceiver> {
         ensure!(
             self.event_session_id.is_some(),
             "session actor was not configured for event fan-out"
         );
         let (tx, rx) = mpsc::sync_channel(EVENT_SUBSCRIBER_BUFFER);
-        self.subscribers.push(tx);
+        let next_event_seq = after_event_seq
+            .map(|event_seq| event_seq.saturating_add(1))
+            .unwrap_or(self.next_event_seq);
+        self.subscribers
+            .push(EventSubscriber { tx, next_event_seq });
+        self.flush_subscribers();
         Ok(rx)
     }
 
     fn broadcast(&mut self, event: SessionEvent) {
-        self.subscribers
-            .retain(|subscriber| match subscriber.try_send(event.clone()) {
-                Ok(()) => true,
-                Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => false,
-            });
+        self.record_event(event);
+        self.flush_subscribers();
+    }
+
+    fn record_event(&mut self, event: SessionEvent) {
+        let envelope = SessionEventEnvelope {
+            event_seq: self.next_event_seq,
+            event,
+        };
+        self.next_event_seq += 1;
+        self.event_log.push_back(envelope);
+        while self.event_log.len() > EVENT_REPLAY_BUFFER {
+            self.event_log.pop_front();
+        }
+    }
+
+    fn flush_subscribers(&mut self) {
+        let mut retained = Vec::with_capacity(self.subscribers.len());
+        let mut subscribers = std::mem::take(&mut self.subscribers);
+
+        for mut subscriber in subscribers.drain(..) {
+            if self.flush_subscriber(&mut subscriber) {
+                retained.push(subscriber);
+            }
+        }
+
+        self.subscribers = retained;
+    }
+
+    fn flush_subscriber(&self, subscriber: &mut EventSubscriber) -> bool {
+        loop {
+            if subscriber.next_event_seq >= self.next_event_seq {
+                return true;
+            }
+
+            let Some(oldest_event_seq) = self.event_log.front().map(|event| event.event_seq) else {
+                return true;
+            };
+
+            if subscriber.next_event_seq < oldest_event_seq {
+                let resync = self.resync_envelope();
+                return match subscriber.tx.try_send(resync) {
+                    Ok(()) => {
+                        subscriber.next_event_seq = self.next_event_seq;
+                        true
+                    }
+                    Err(TrySendError::Full(_)) => true,
+                    Err(TrySendError::Disconnected(_)) => false,
+                };
+            }
+
+            let event_index = (subscriber.next_event_seq - oldest_event_seq) as usize;
+            let Some(envelope) = self.event_log.get(event_index).cloned() else {
+                return true;
+            };
+
+            match subscriber.tx.try_send(envelope) {
+                Ok(()) => subscriber.next_event_seq += 1,
+                Err(TrySendError::Full(_)) => return true,
+                Err(TrySendError::Disconnected(_)) => return false,
+            }
+        }
+    }
+
+    fn resync_envelope(&self) -> SessionEventEnvelope {
+        let latest_event_seq = self.next_event_seq.saturating_sub(1);
+        let session_id = self
+            .event_session_id
+            .clone()
+            .expect("event fan-out requires session id");
+        SessionEventEnvelope {
+            event_seq: latest_event_seq,
+            event: SessionEvent::ResyncRequired {
+                session_id,
+                latest_event_seq,
+                snapshot: self.snapshot(),
+            },
+        }
     }
 
     fn broadcast_exit(&mut self) {
@@ -1022,7 +1184,10 @@ fn reject_command_during_shutdown(command: ActorCommand) {
         ActorCommand::Snapshot { response } => {
             let _ = response.send(Err(error));
         }
-        ActorCommand::SubscribeEvents { response } => {
+        ActorCommand::StyledRows { response, .. } => {
+            let _ = response.send(Err(error));
+        }
+        ActorCommand::SubscribeEvents { response, .. } => {
             let _ = response.send(Err(error));
         }
         ActorCommand::BroadcastEvent { response, .. } => {
@@ -1096,11 +1261,17 @@ fn visible_rows(terminal: &Terminal) -> Vec<String> {
         .collect()
 }
 
+#[cfg(test)]
 fn styled_visible_rows(terminal: &Terminal) -> Vec<StyledRow> {
     let screen = terminal.screen();
     let end = screen.scrollback_rows();
+    styled_visible_rows_for_range(terminal, 0, end)
+}
+
+fn styled_visible_rows_for_range(terminal: &Terminal, start: usize, end: usize) -> Vec<StyledRow> {
+    let screen = terminal.screen();
     let palette = ColorPalette::default();
-    let mut lines = screen.lines_in_phys_range(0..end);
+    let mut lines = screen.lines_in_phys_range(start..end);
 
     lines
         .iter_mut()
@@ -1278,6 +1449,23 @@ mod tests {
     }
 
     #[test]
+    fn output_state_tracks_bracketed_paste_mode() {
+        let log_path = unique_log_path();
+        let mut output = test_output_state(&log_path, SessionSize::default());
+
+        assert!(!output.terminal.bracketed_paste_enabled());
+        output
+            .ingest(b"\x1b[?2004h")
+            .expect("enable bracketed paste");
+        assert!(output.terminal.bracketed_paste_enabled());
+        output
+            .ingest(b"\x1b[?2004l")
+            .expect("disable bracketed paste");
+        assert!(!output.terminal.bracketed_paste_enabled());
+        let _ = std::fs::remove_file(log_path);
+    }
+
+    #[test]
     fn output_state_skips_cwd_scan_when_chunk_has_no_escape() {
         let log_path = unique_log_path();
         let mut output = test_output_state(&log_path, SessionSize::default());
@@ -1426,6 +1614,83 @@ mod tests {
             "scrollback rows should include line-5: {rows:?}"
         );
         assert!(rows.len() > output.terminal.screen().physical_rows);
+        let _ = std::fs::remove_file(log_path);
+    }
+
+    #[test]
+    fn styled_rows_can_be_limited_to_current_viewport() {
+        let log_path = unique_log_path();
+        let mut output = test_output_state(
+            &log_path,
+            SessionSize {
+                rows: 3,
+                cols: 24,
+                pixel_width: 240,
+                pixel_height: 60,
+                dpi: 96,
+            },
+        );
+
+        output
+            .ingest(b"\x1b[31mline-1\r\nline-2\r\nline-3\r\nline-4\r\nline-5\x1b[0m")
+            .expect("ingest scrollback output");
+        let row_count = output.terminal.screen().scrollback_rows();
+        let styled_start = row_count.saturating_sub(output.terminal.screen().physical_rows);
+        let rows = styled_visible_rows_for_range(&output.terminal, styled_start, row_count);
+
+        assert_eq!(rows.len(), output.terminal.screen().physical_rows);
+        assert!(
+            rows.iter()
+                .flat_map(|row| &row.spans)
+                .any(|span| span.text.contains("line-5"))
+        );
+        assert!(
+            rows.iter()
+                .flat_map(|row| &row.spans)
+                .all(|span| !span.text.contains("line-1"))
+        );
+        let _ = std::fs::remove_file(log_path);
+    }
+
+    #[test]
+    fn styled_rows_response_extracts_requested_history_range() {
+        let log_path = unique_log_path();
+        let mut config = command_that_prints_marker(log_path.clone());
+        config.size = SessionSize {
+            rows: 2,
+            cols: 24,
+            pixel_width: 240,
+            pixel_height: 40,
+            dpi: 96,
+        };
+        let actor = SessionActor::spawn(config).expect("spawn session actor");
+        let snapshot = wait_for_visible_marker(&actor, "argus-ready");
+        let end = snapshot.visible_rows.len().min(2);
+        let response = actor.styled_rows(0, end).expect("load styled rows");
+
+        assert_eq!(response.output_seq, snapshot.output_seq);
+        assert_eq!(response.start, 0);
+        assert_eq!(response.rows.len(), end);
+        actor.shutdown().expect("shutdown session actor");
+        let _ = std::fs::remove_file(log_path);
+    }
+
+    #[test]
+    fn session_snapshot_styles_only_current_viewport() {
+        let log_path = unique_log_path();
+        let actor = SessionActor::spawn(command_that_prints_marker(log_path.clone()))
+            .expect("spawn session actor");
+        let snapshot = wait_for_visible_marker(&actor, "argus-ready");
+
+        assert!(snapshot.styled_rows.len() <= snapshot.size.rows);
+        assert_eq!(
+            snapshot.styled_rows_start,
+            snapshot
+                .visible_rows
+                .len()
+                .saturating_sub(snapshot.size.rows)
+        );
+        actor.shutdown().expect("shutdown session actor");
         let _ = std::fs::remove_file(log_path);
     }
 
@@ -1960,6 +2225,96 @@ mod tests {
         let _ = std::fs::remove_dir_all(&log_dir);
     }
 
+    #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "portable-pty ConPTY EOF handling needs a dedicated Windows lifecycle test"
+    )]
+    fn full_event_buffer_drops_output_without_disconnect() {
+        let log_dir = unique_log_dir();
+        let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
+        let request = StartSessionRequest::new(long_running_shell_command());
+        let session_id = manager.start_session(request).expect("start session");
+        let subscriber = manager
+            .subscribe_session_events(session_id.clone())
+            .expect("subscribe client");
+
+        for index in 0..=EVENT_SUBSCRIBER_BUFFER {
+            let sessions = manager.sessions().expect("lock sessions");
+            let session = sessions.get(&session_id).expect("managed session");
+            session
+                .actor
+                .broadcast_event(SessionEvent::Output {
+                    session_id: session_id.clone(),
+                    output_seq: index as u64,
+                    bytes: format!("burst-{index}").into_bytes(),
+                })
+                .expect("broadcast output");
+        }
+
+        for _ in 0..EVENT_SUBSCRIBER_BUFFER {
+            let _ = subscriber
+                .recv_timeout(Duration::from_secs(1))
+                .expect("drain queued output event");
+        }
+
+        {
+            let sessions = manager.sessions().expect("lock sessions");
+            let session = sessions.get(&session_id).expect("managed session");
+            session
+                .actor
+                .broadcast_event(SessionEvent::Output {
+                    session_id: session_id.clone(),
+                    output_seq: 999,
+                    bytes: b"still-subscribed".to_vec(),
+                })
+                .expect("broadcast sentinel output");
+        }
+
+        wait_for_output_event(&subscriber, &session_id, "still-subscribed");
+        manager
+            .shutdown_session(session_id)
+            .expect("shutdown managed session");
+        let _ = std::fs::remove_dir_all(&log_dir);
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn full_event_buffer_replays_exit_after_subscriber_drains() {
+        let log_dir = unique_log_dir();
+        let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
+        let request = StartSessionRequest::new(long_running_shell_command());
+        let session_id = manager.start_session(request).expect("start session");
+        let subscriber = manager
+            .subscribe_session_events(session_id.clone())
+            .expect("subscribe client");
+
+        for index in 0..=EVENT_SUBSCRIBER_BUFFER {
+            let sessions = manager.sessions().expect("lock sessions");
+            let session = sessions.get(&session_id).expect("managed session");
+            session
+                .actor
+                .broadcast_event(SessionEvent::Output {
+                    session_id: session_id.clone(),
+                    output_seq: index as u64,
+                    bytes: format!("burst-{index}").into_bytes(),
+                })
+                .expect("broadcast output");
+        }
+
+        {
+            let sessions = manager.sessions().expect("lock sessions");
+            let session = sessions.get(&session_id).expect("managed session");
+            session
+                .actor
+                .write_input(b"exit\n".to_vec())
+                .expect("exit shell");
+        }
+
+        wait_for_exit_event(&subscriber, &session_id);
+        let _ = std::fs::remove_dir_all(&log_dir);
+    }
+
     fn unique_log_path() -> PathBuf {
         let unique = format!(
             "argus-pty-session-{}-{:?}.log",
@@ -2150,7 +2505,8 @@ mod tests {
                 .recv_timeout(remaining.min(Duration::from_millis(100)))
                 .unwrap_or_else(|error| {
                     panic!("event stream ended while waiting for output marker {marker}: {error}")
-                });
+                })
+                .event;
             if let SessionEvent::Output {
                 session_id: event_session_id,
                 bytes,
@@ -2209,10 +2565,15 @@ mod tests {
             }
 
             match receiver.recv_timeout(remaining.min(Duration::from_millis(20))) {
-                Ok(SessionEvent::Exited {
-                    session_id: event_session_id,
-                    ..
-                }) if &event_session_id == session_id => {
+                Ok(envelope)
+                    if matches!(
+                        envelope.event,
+                        SessionEvent::Exited {
+                            session_id: ref event_session_id,
+                            ..
+                        } if event_session_id == session_id
+                    ) =>
+                {
                     panic!("received duplicate exit event for session {session_id}");
                 }
                 Ok(_) => {}
@@ -2233,7 +2594,7 @@ mod tests {
             let remaining = deadline.saturating_duration_since(Instant::now());
             assert!(!remaining.is_zero(), "timed out waiting for {label}");
             match receiver.recv_timeout(remaining.min(Duration::from_millis(100))) {
-                Ok(event) if matches_event(&event) => return event,
+                Ok(envelope) if matches_event(&envelope.event) => return envelope.event,
                 Ok(_) => {}
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {

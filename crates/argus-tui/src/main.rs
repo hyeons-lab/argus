@@ -162,12 +162,19 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut LocalSession
     let mut pending_confirmation = None;
     let mut terminal_area = Rect::default();
     let mut selection = None;
+    let mut needs_draw = true;
 
     loop {
-        app.drain_events();
-        terminal.draw(|frame| {
-            terminal_area = draw(frame, app, sidebar_visible, pending_confirmation, selection);
-        })?;
+        needs_draw |= app.drain_events();
+        if needs_draw {
+            if terminal_area.height > 0 {
+                app.ensure_selected_styled_rows(usize::from(terminal_area.height));
+            }
+            terminal.draw(|frame| {
+                terminal_area = draw(frame, app, sidebar_visible, pending_confirmation, selection);
+            })?;
+            needs_draw = false;
+        }
 
         if !event::poll(UI_EVENT_POLL)? {
             continue;
@@ -176,6 +183,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut LocalSession
         match event::read()? {
             Event::Key(key) if key.kind != KeyEventKind::Press => {}
             Event::Key(key) if should_exit(key) => {
+                needs_draw = true;
                 if app.exits_by_shutting_down_sessions() {
                     if pending_confirmation == Some(Confirmation::Exit) {
                         return Ok(());
@@ -187,11 +195,13 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut LocalSession
             }
             Event::Key(key) => match key_to_command(key) {
                 Some(AppCommand::New) => {
+                    needs_draw = true;
                     pending_confirmation = None;
                     selection = None;
                     app.create_session(current_session_size(sidebar_visible)?);
                 }
                 Some(AppCommand::Close) => {
+                    needs_draw = true;
                     if pending_confirmation != Some(Confirmation::CloseSession) {
                         pending_confirmation = Some(Confirmation::CloseSession);
                         continue;
@@ -201,32 +211,38 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut LocalSession
                     app.close_selected_session();
                 }
                 Some(AppCommand::Next) => {
+                    needs_draw = true;
                     pending_confirmation = None;
                     selection = None;
                     app.select_next_session();
                 }
                 Some(AppCommand::Previous) => {
+                    needs_draw = true;
                     pending_confirmation = None;
                     selection = None;
                     app.select_previous_session();
                 }
                 Some(AppCommand::ToggleSidebar) => {
+                    needs_draw = true;
                     pending_confirmation = None;
                     selection = None;
                     sidebar_visible = !sidebar_visible;
                     app.resize(current_session_size(sidebar_visible)?);
                 }
                 Some(AppCommand::ScrollUp) => {
+                    needs_draw = true;
                     pending_confirmation = None;
                     selection = None;
                     app.scroll_selected(terminal_page_scroll_lines(terminal_area));
                 }
                 Some(AppCommand::ScrollDown) => {
+                    needs_draw = true;
                     pending_confirmation = None;
                     selection = None;
                     app.scroll_selected(-terminal_page_scroll_lines(terminal_area));
                 }
                 None => {
+                    needs_draw = true;
                     pending_confirmation = None;
                     if copy_selection_on_control_c(
                         key,
@@ -244,14 +260,19 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut LocalSession
                 }
             },
             Event::Resize(cols, rows) => {
+                needs_draw = true;
                 pending_confirmation = None;
                 selection = None;
                 app.resize(session_size_from_app_terminal(rows, cols, sidebar_visible));
             }
             Event::Paste(text) => {
+                needs_draw = true;
                 pending_confirmation = None;
                 selection = None;
-                app.write_input(bracketed_paste_input(&text));
+                app.write_input(paste_input(
+                    &text,
+                    app.view().snapshot.bracketed_paste_enabled,
+                ));
             }
             Event::Mouse(mouse) => {
                 if handle_mouse_event(
@@ -261,6 +282,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut LocalSession
                     &mut selection,
                     terminal.backend_mut(),
                 )? {
+                    needs_draw = true;
                     pending_confirmation = None;
                 }
             }
@@ -1017,7 +1039,11 @@ fn key_to_input(key: KeyEvent) -> Option<Vec<u8>> {
     }
 }
 
-fn bracketed_paste_input(text: &str) -> Vec<u8> {
+fn paste_input(text: &str, bracketed_paste_enabled: bool) -> Vec<u8> {
+    if !bracketed_paste_enabled {
+        return text.as_bytes().to_vec();
+    }
+
     let mut bytes = Vec::with_capacity(b"\x1b[200~".len() + text.len() + b"\x1b[201~".len());
     bytes.extend_from_slice(b"\x1b[200~");
     bytes.extend_from_slice(text.as_bytes());
@@ -1190,9 +1216,17 @@ mod tests {
     }
 
     #[test]
-    fn paste_input_preserves_bracketed_paste_boundaries() {
+    fn paste_input_preserves_raw_text_without_bracketed_paste_mode() {
         assert_eq!(
-            bracketed_paste_input("echo one\necho two"),
+            paste_input("echo one\necho two", false),
+            b"echo one\necho two"
+        );
+    }
+
+    #[test]
+    fn paste_input_preserves_bracketed_paste_boundaries_when_enabled() {
+        assert_eq!(
+            paste_input("echo one\necho two", true),
             b"\x1b[200~echo one\necho two\x1b[201~"
         );
     }
@@ -1234,6 +1268,7 @@ mod tests {
                     visible: false,
                 },
                 current_working_directory: None,
+                bracketed_paste_enabled: false,
                 exited: false,
             },
             lease: argus_core::session::InputLeaseState::default(),
@@ -1473,6 +1508,7 @@ mod tests {
                 visible: true,
             },
             current_working_directory: None,
+            bracketed_paste_enabled: false,
             exited: false,
         };
 

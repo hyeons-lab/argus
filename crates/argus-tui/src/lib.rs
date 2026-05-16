@@ -6,7 +6,7 @@ use anyhow::Result;
 use argus_core::session::{
     AttachMode, AttachSessionRequest, ClientId, CompletedSession, InputLeaseState,
     ResizeSessionRequest, SessionApi, SessionEvent, SessionEventReceiver, SessionId, SessionSize,
-    SessionSnapshot, StartSessionRequest, WriteInputRequest,
+    SessionSnapshot, StartSessionRequest, StyledRowsRequest, WriteInputRequest,
 };
 #[cfg(unix)]
 use argus_daemon::ipc::UnixSocketClient;
@@ -183,19 +183,71 @@ impl LocalSessionApp {
         self.last_error = None;
     }
 
+    pub fn ensure_selected_styled_rows(&mut self, visible_height: usize) -> bool {
+        let Some(session) = self.sessions.get(self.selected) else {
+            return false;
+        };
+        let Some((start, end)) = visible_row_range(
+            &session.view.snapshot,
+            visible_height,
+            session.view.scroll_offset,
+        ) else {
+            return false;
+        };
+        if snapshot_has_styled_range(&session.view.snapshot, start, end) {
+            return false;
+        }
+
+        let session_id = session.view.session_id.clone();
+        let output_seq = session.view.snapshot.output_seq;
+        match self.manager.styled_rows(StyledRowsRequest {
+            session_id,
+            start,
+            end,
+        }) {
+            Ok(response) => {
+                let Some(session) = self.sessions.get_mut(self.selected) else {
+                    return false;
+                };
+                let is_scrollback_range = end < session.view.snapshot.visible_rows.len();
+                let response_matches_snapshot = response.output_seq == output_seq
+                    || (is_scrollback_range && response.output_seq >= output_seq);
+                if session.view.snapshot.output_seq == output_seq
+                    && response_matches_snapshot
+                    && response.start == start
+                {
+                    session.view.snapshot.styled_rows_start = response.start;
+                    session.view.snapshot.styled_rows = response.rows;
+                    self.last_error = None;
+                    true
+                } else {
+                    false
+                }
+            }
+            Err(error) => {
+                self.last_error = Some(format!("loading styled terminal history: {error}"));
+                true
+            }
+        }
+    }
+
     pub fn reset_selected_scroll(&mut self) {
         if let Some(session) = self.sessions.get_mut(self.selected) {
             session.view.scroll_offset = 0;
         }
     }
 
-    pub fn drain_events(&mut self) {
+    pub fn drain_events(&mut self) -> bool {
+        let mut changed = false;
         for session in &mut self.sessions {
             let mut refresh_snapshot = false;
 
             for _ in 0..MAX_EVENTS_PER_SESSION_TICK {
                 match session.events.try_recv() {
-                    Ok(event) => refresh_snapshot |= apply_event_to_view(&mut session.view, event),
+                    Ok(envelope) => {
+                        refresh_snapshot |= apply_event_to_view(&mut session.view, envelope.event);
+                        changed = true;
+                    }
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {
                         if !session.view.snapshot.exited {
@@ -203,6 +255,7 @@ impl LocalSessionApp {
                                 "session {} event stream closed",
                                 session.view.session_id
                             ));
+                            changed = true;
                         }
                         break;
                     }
@@ -212,15 +265,20 @@ impl LocalSessionApp {
             if refresh_snapshot {
                 let session_id = session.view.session_id.clone();
                 match self.manager.snapshot_session(session_id) {
-                    Ok(snapshot) => replace_snapshot_preserving_scroll(&mut session.view, snapshot),
+                    Ok(snapshot) => {
+                        replace_snapshot_preserving_scroll(&mut session.view, snapshot);
+                        changed = true;
+                    }
                     Err(error) => {
                         self.last_error = Some(format!(
                             "refreshing session snapshot after output events: {error}"
                         ));
+                        changed = true;
                     }
                 }
             }
         }
+        changed
     }
 
     pub fn write_input(&mut self, bytes: Vec<u8>) {
@@ -245,7 +303,7 @@ impl LocalSessionApp {
 
     pub fn resize(&mut self, size: SessionSize) {
         self.current_size = size;
-        self.resize_selected_session();
+        self.resize_sessions();
     }
 
     pub fn shutdown(self) -> Result<Vec<CompletedSession>> {
@@ -328,6 +386,38 @@ impl LocalSessionApp {
                 self.last_error = None;
             }
             Err(error) => self.last_error = Some(format!("resizing selected session: {error}")),
+        }
+    }
+
+    fn resize_sessions(&mut self) {
+        let mut resize_error = None;
+        let mut resized_any = false;
+
+        for session in &mut self.sessions {
+            if session.view.snapshot.exited || session.view.snapshot.size == self.current_size {
+                continue;
+            }
+
+            match self.manager.resize_session(ResizeSessionRequest {
+                session_id: session.view.session_id.clone(),
+                size: self.current_size.clone(),
+            }) {
+                Ok(snapshot) => {
+                    session.view.snapshot = snapshot;
+                    resized_any = true;
+                }
+                Err(error) => {
+                    resize_error.get_or_insert_with(|| {
+                        format!("resizing session {}: {error}", session.view.session_id)
+                    });
+                }
+            }
+        }
+
+        if let Some(error) = resize_error {
+            self.last_error = Some(error);
+        } else if resized_any {
+            self.last_error = None;
         }
     }
 }
@@ -415,6 +505,14 @@ fn start_local_session(
 
 pub fn apply_event_to_view(view: &mut SessionView, event: SessionEvent) -> bool {
     match event {
+        SessionEvent::ResyncRequired {
+            session_id,
+            snapshot,
+            ..
+        } if session_id == view.session_id => {
+            replace_snapshot_preserving_scroll(view, snapshot);
+            false
+        }
         SessionEvent::Output { session_id, .. } if session_id == view.session_id => true,
         SessionEvent::Snapshot {
             session_id,
@@ -466,6 +564,33 @@ fn replace_snapshot_preserving_scroll(view: &mut SessionView, snapshot: SessionS
     view.snapshot = snapshot;
 }
 
+fn visible_row_range(
+    snapshot: &SessionSnapshot,
+    visible_height: usize,
+    scroll_offset: usize,
+) -> Option<(usize, usize)> {
+    if visible_height == 0 {
+        return None;
+    }
+    let start = snapshot
+        .visible_rows
+        .len()
+        .saturating_sub(visible_height)
+        .saturating_sub(scroll_offset);
+    let end = start
+        .saturating_add(visible_height)
+        .min(snapshot.visible_rows.len());
+    (start < end).then_some((start, end))
+}
+
+fn snapshot_has_styled_range(snapshot: &SessionSnapshot, start: usize, end: usize) -> bool {
+    let styled_start = snapshot.styled_rows_start;
+    let Some(styled_end) = styled_start.checked_add(snapshot.styled_rows.len()) else {
+        return false;
+    };
+    start >= styled_start && end <= styled_end
+}
+
 pub fn session_size_from_terminal(rows: u16, cols: u16) -> SessionSize {
     SessionSize {
         rows: usize::from(rows.max(1)),
@@ -508,7 +633,7 @@ fn default_shell_request() -> StartSessionRequest {
     let mut request = StartSessionRequest::new("/bin/sh");
     request.args = vec![
         "-lc".to_string(),
-        "stty sane echo; export ARGUS_PROMPT_COMMAND=\"$PROMPT_COMMAND\"; export PROMPT_COMMAND='printf \"\\033]7;file://%s%s\\033\\\\\" \"${HOSTNAME:-localhost}\" \"$PWD\"; if [ -n \"$ARGUS_PROMPT_COMMAND\" ]; then eval \"$ARGUS_PROMPT_COMMAND\"; fi'; exec \"${SHELL:-/bin/sh}\""
+        "stty sane echo; export ARGUS_PROMPT_COMMAND=\"$PROMPT_COMMAND\"; export PROMPT_COMMAND='__argus_pwd=$(printf \"%s\" \"$PWD\" | sed \"s/%/%25/g; s/ /%20/g; s/#/%23/g\"); printf \"\\033]7;file://%s%s\\033\\\\\" \"${HOSTNAME:-localhost}\" \"$__argus_pwd\"; unset __argus_pwd; if [ -n \"$ARGUS_PROMPT_COMMAND\" ]; then eval \"$ARGUS_PROMPT_COMMAND\"; fi'; exec \"${SHELL:-/bin/sh}\""
             .to_string(),
     ];
     request
@@ -520,7 +645,9 @@ mod tests {
     use argus_core::session::TerminalCursor;
     use argus_core::session::{
         AttachSessionResponse, InputControllerKind, InputLeaseHolder, InputLeaseRequest,
-        LeaseChange, LeaseChangeAction, ResizeSessionRequest, StartSessionRequest,
+        LeaseChange, LeaseChangeAction, ResizeSessionRequest, SessionEventEnvelope,
+        StartSessionRequest, StyledRow, StyledRowsResponse, StyledSpan, TerminalColor,
+        TerminalStyle,
     };
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
@@ -581,12 +708,15 @@ mod tests {
         let session_id = SessionId::new("session-7").expect("session id");
         let (event_tx, event_rx) = std::sync::mpsc::channel();
         event_tx
-            .send(SessionEvent::Exited {
-                session_id: session_id.clone(),
-                completed: CompletedSession {
-                    output_seq: 4,
-                    bytes_logged: 9,
-                    visible_rows: vec!["red".to_string()],
+            .send(SessionEventEnvelope {
+                event_seq: 1,
+                event: SessionEvent::Exited {
+                    session_id: session_id.clone(),
+                    completed: CompletedSession {
+                        output_seq: 4,
+                        bytes_logged: 9,
+                        visible_rows: vec!["red".to_string()],
+                    },
                 },
             })
             .expect("queue exit event");
@@ -617,6 +747,7 @@ mod tests {
                 visible: false,
             },
             current_working_directory: None,
+            bracketed_paste_enabled: false,
             exited: true,
         };
 
@@ -631,10 +762,37 @@ mod tests {
         )
         .expect("start daemon-backed app");
 
-        app.drain_events();
+        assert!(app.drain_events());
 
         assert!(app.view().snapshot.exited);
         assert_eq!(app.view().snapshot.styled_rows, final_snapshot.styled_rows);
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn default_shell_prompt_command_percent_encodes_osc7_paths() {
+        let request = default_shell_request();
+        let command = request.args.get(1).expect("shell command");
+
+        assert!(command.contains("sed \"s/%/%25/g; s/ /%20/g; s/#/%23/g\""));
+        assert!(command.contains("\"$__argus_pwd\""));
+        assert!(!command.contains("\"$PWD\"; if"));
+        assert!(!command.contains("${PWD//"));
+        assert!(!command.contains("${__argus_pwd//"));
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn default_shell_bootstrap_is_posix_shell_syntax() {
+        let request = default_shell_request();
+        let command = request.args.get(1).expect("shell command");
+
+        let status = std::process::Command::new("/bin/sh")
+            .args(["-n", "-c", command])
+            .status()
+            .expect("check default shell bootstrap syntax");
+
+        assert!(status.success());
     }
 
     #[test]
@@ -730,6 +888,88 @@ mod tests {
         );
 
         assert_eq!(view.scroll_offset, 1);
+    }
+
+    #[test]
+    fn ensure_selected_styled_rows_loads_scrolled_visible_range() {
+        let session_id = SessionId::new("session-1").expect("session id");
+        let mut snapshot = test_view(session_id.clone()).snapshot;
+        snapshot.output_seq = 7;
+        snapshot.visible_rows = vec!["red".into(), "green".into(), "blue".into(), "white".into()];
+        snapshot.styled_rows_start = 2;
+        snapshot.styled_rows = vec![
+            StyledRow { spans: Vec::new() },
+            StyledRow { spans: Vec::new() },
+        ];
+        let (tx, rx) = std::sync::mpsc::channel();
+        drop(tx);
+        let request = Arc::new(Mutex::new(None));
+        let mut app = LocalSessionApp {
+            manager: Box::new(StyledRowsSessionApi {
+                request: request.clone(),
+                output_seq: 7,
+            }),
+            client_id: ClientId::new("local-tui").expect("client id"),
+            owns_sessions: false,
+            sessions: vec![SessionRuntime {
+                events: rx,
+                view: SessionView {
+                    session_id,
+                    snapshot,
+                    lease: InputLeaseState::default(),
+                    last_completed: None,
+                    scroll_offset: 2,
+                },
+            }],
+            selected: 0,
+            current_size: SessionSize::default(),
+            last_error: None,
+        };
+
+        assert!(app.ensure_selected_styled_rows(2));
+        assert_eq!(
+            *request.lock().expect("request lock"),
+            Some((0usize, 2usize))
+        );
+        assert_eq!(app.view().snapshot.styled_rows_start, 0);
+        assert_eq!(app.view().snapshot.styled_rows.len(), 2);
+        assert_eq!(app.view().snapshot.styled_rows[0].spans[0].text, "red");
+    }
+
+    #[test]
+    fn ensure_selected_styled_rows_keeps_scrollback_colors_when_output_advances() {
+        let session_id = SessionId::new("session-1").expect("session id");
+        let mut snapshot = test_view(session_id.clone()).snapshot;
+        snapshot.output_seq = 7;
+        snapshot.visible_rows = vec!["red".into(), "green".into(), "blue".into(), "white".into()];
+        let (tx, rx) = std::sync::mpsc::channel();
+        drop(tx);
+        let request = Arc::new(Mutex::new(None));
+        let mut app = LocalSessionApp {
+            manager: Box::new(StyledRowsSessionApi {
+                request: request.clone(),
+                output_seq: 8,
+            }),
+            client_id: ClientId::new("local-tui").expect("client id"),
+            owns_sessions: false,
+            sessions: vec![SessionRuntime {
+                events: rx,
+                view: SessionView {
+                    session_id,
+                    snapshot,
+                    lease: InputLeaseState::default(),
+                    last_completed: None,
+                    scroll_offset: 2,
+                },
+            }],
+            selected: 0,
+            current_size: SessionSize::default(),
+            last_error: None,
+        };
+
+        assert!(app.ensure_selected_styled_rows(2));
+        assert_eq!(app.view().snapshot.styled_rows_start, 0);
+        assert_eq!(app.view().snapshot.styled_rows[0].spans[0].text, "red");
     }
 
     #[test]
@@ -910,6 +1150,52 @@ mod tests {
     }
 
     #[test]
+    fn terminal_resize_updates_inactive_sessions() {
+        let first_id = SessionId::new("session-7").expect("session id");
+        let second_id = SessionId::new("session-8").expect("session id");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let new_size = SessionSize {
+            rows: 50,
+            cols: 120,
+            ..SessionSize::default()
+        };
+        let mut app = LocalSessionApp {
+            manager: Box::new(ResizeRecordingSessionApi {
+                requests: requests.clone(),
+            }),
+            client_id: ClientId::new("local-tui").expect("client id"),
+            owns_sessions: false,
+            sessions: vec![
+                SessionRuntime {
+                    events: closed_event_receiver(),
+                    view: test_view(first_id.clone()),
+                },
+                SessionRuntime {
+                    events: closed_event_receiver(),
+                    view: test_view(second_id.clone()),
+                },
+            ],
+            selected: 0,
+            current_size: SessionSize::default(),
+            last_error: Some("stale resize error".to_string()),
+        };
+
+        app.resize(new_size.clone());
+
+        let requests = requests.lock().expect("requests lock");
+        assert_eq!(
+            *requests,
+            vec![
+                (first_id.clone(), new_size.clone()),
+                (second_id.clone(), new_size.clone()),
+            ]
+        );
+        assert_eq!(app.sessions[0].view.snapshot.size, new_size);
+        assert_eq!(app.sessions[1].view.snapshot.size, new_size);
+        assert_eq!(app.last_error(), None);
+    }
+
+    #[test]
     fn daemon_backed_apps_use_unique_client_ids() {
         let first = LocalSessionApp::start_with_manager(
             Box::new(RecordingSessionApi {
@@ -951,6 +1237,7 @@ mod tests {
                     visible: true,
                 },
                 current_working_directory: None,
+                bracketed_paste_enabled: false,
                 exited: false,
             },
             lease: InputLeaseState::default(),
@@ -965,6 +1252,11 @@ mod tests {
             std::process::id(),
             std::thread::current().id()
         ))
+    }
+
+    fn closed_event_receiver() -> SessionEventReceiver {
+        let (_tx, rx) = std::sync::mpsc::channel();
+        rx
     }
 
     #[derive(Default)]
@@ -984,6 +1276,15 @@ mod tests {
         session_id: SessionId,
         event_rx: Mutex<Option<SessionEventReceiver>>,
         final_snapshot: SessionSnapshot,
+    }
+
+    struct StyledRowsSessionApi {
+        request: Arc<Mutex<Option<(usize, usize)>>>,
+        output_seq: u64,
+    }
+
+    struct ResizeRecordingSessionApi {
+        requests: Arc<Mutex<Vec<(SessionId, SessionSize)>>>,
     }
 
     impl SessionApi for RecordingSessionApi {
@@ -1011,6 +1312,7 @@ mod tests {
                         visible: true,
                     },
                     current_working_directory: None,
+                    bracketed_paste_enabled: false,
                     exited: false,
                 },
                 lease: InputLeaseState {
@@ -1067,6 +1369,10 @@ mod tests {
             unreachable!("test does not snapshot sessions")
         }
 
+        fn styled_rows(&self, _request: StyledRowsRequest) -> Result<StyledRowsResponse> {
+            unreachable!("test does not load styled rows")
+        }
+
         fn shutdown_session(&self, _session_id: SessionId) -> Result<CompletedSession> {
             self.counts.lock().expect("counts lock").shutdowns += 1;
             Ok(CompletedSession {
@@ -1101,6 +1407,7 @@ mod tests {
                         visible: true,
                     },
                     current_working_directory: None,
+                    bracketed_paste_enabled: false,
                     exited: false,
                 },
                 lease: InputLeaseState {
@@ -1156,6 +1463,149 @@ mod tests {
 
         fn snapshot_session(&self, _session_id: SessionId) -> Result<SessionSnapshot> {
             Ok(self.final_snapshot.clone())
+        }
+
+        fn styled_rows(&self, _request: StyledRowsRequest) -> Result<StyledRowsResponse> {
+            unreachable!("test does not load styled rows")
+        }
+
+        fn shutdown_session(&self, _session_id: SessionId) -> Result<CompletedSession> {
+            unreachable!("test does not shut down sessions")
+        }
+    }
+
+    impl SessionApi for StyledRowsSessionApi {
+        fn list_sessions(&self) -> Result<Vec<SessionId>> {
+            unreachable!("test does not list sessions")
+        }
+
+        fn start_session(&self, _request: StartSessionRequest) -> Result<SessionId> {
+            unreachable!("test does not start sessions")
+        }
+
+        fn attach_session(&self, _request: AttachSessionRequest) -> Result<AttachSessionResponse> {
+            unreachable!("test does not attach sessions")
+        }
+
+        fn subscribe_session_events(&self, _session_id: SessionId) -> Result<SessionEventReceiver> {
+            unreachable!("test does not subscribe")
+        }
+
+        fn acquire_input_lease(&self, _request: InputLeaseRequest) -> Result<LeaseChange> {
+            unreachable!("test does not acquire leases")
+        }
+
+        fn release_input_lease(
+            &self,
+            _session_id: SessionId,
+            _client_id: ClientId,
+        ) -> Result<LeaseChange> {
+            unreachable!("test does not release leases")
+        }
+
+        fn write_input(&self, _request: WriteInputRequest) -> Result<()> {
+            unreachable!("test does not write input")
+        }
+
+        fn resize_session(&self, _request: ResizeSessionRequest) -> Result<SessionSnapshot> {
+            unreachable!("test does not resize sessions")
+        }
+
+        fn snapshot_session(&self, _session_id: SessionId) -> Result<SessionSnapshot> {
+            unreachable!("test does not snapshot sessions")
+        }
+
+        fn styled_rows(&self, request: StyledRowsRequest) -> Result<StyledRowsResponse> {
+            *self.request.lock().expect("request lock") = Some((request.start, request.end));
+            Ok(StyledRowsResponse {
+                output_seq: self.output_seq,
+                start: request.start,
+                rows: vec![
+                    StyledRow {
+                        spans: vec![StyledSpan {
+                            text: "red".to_string(),
+                            style: TerminalStyle {
+                                foreground: Some(TerminalColor {
+                                    red: 255,
+                                    green: 0,
+                                    blue: 0,
+                                }),
+                                ..TerminalStyle::default()
+                            },
+                        }],
+                    },
+                    StyledRow {
+                        spans: vec![StyledSpan {
+                            text: "green".to_string(),
+                            style: TerminalStyle {
+                                foreground: Some(TerminalColor {
+                                    red: 0,
+                                    green: 255,
+                                    blue: 0,
+                                }),
+                                ..TerminalStyle::default()
+                            },
+                        }],
+                    },
+                ],
+            })
+        }
+
+        fn shutdown_session(&self, _session_id: SessionId) -> Result<CompletedSession> {
+            unreachable!("test does not shut down sessions")
+        }
+    }
+
+    impl SessionApi for ResizeRecordingSessionApi {
+        fn list_sessions(&self) -> Result<Vec<SessionId>> {
+            unreachable!("test does not list sessions")
+        }
+
+        fn start_session(&self, _request: StartSessionRequest) -> Result<SessionId> {
+            unreachable!("test does not start sessions")
+        }
+
+        fn attach_session(&self, _request: AttachSessionRequest) -> Result<AttachSessionResponse> {
+            unreachable!("test does not attach sessions")
+        }
+
+        fn subscribe_session_events(&self, _session_id: SessionId) -> Result<SessionEventReceiver> {
+            unreachable!("test does not subscribe")
+        }
+
+        fn acquire_input_lease(&self, _request: InputLeaseRequest) -> Result<LeaseChange> {
+            unreachable!("test does not acquire leases")
+        }
+
+        fn release_input_lease(
+            &self,
+            _session_id: SessionId,
+            _client_id: ClientId,
+        ) -> Result<LeaseChange> {
+            unreachable!("test does not release leases")
+        }
+
+        fn write_input(&self, _request: WriteInputRequest) -> Result<()> {
+            unreachable!("test does not write input")
+        }
+
+        fn resize_session(&self, request: ResizeSessionRequest) -> Result<SessionSnapshot> {
+            self.requests
+                .lock()
+                .expect("requests lock")
+                .push((request.session_id.clone(), request.size.clone()));
+
+            let mut view = test_view(request.session_id);
+            view.snapshot.size = request.size;
+            Ok(view.snapshot)
+        }
+
+        fn snapshot_session(&self, _session_id: SessionId) -> Result<SessionSnapshot> {
+            unreachable!("test does not snapshot sessions")
+        }
+
+        fn styled_rows(&self, _request: StyledRowsRequest) -> Result<StyledRowsResponse> {
+            unreachable!("test does not load styled rows")
         }
 
         fn shutdown_session(&self, _session_id: SessionId) -> Result<CompletedSession> {

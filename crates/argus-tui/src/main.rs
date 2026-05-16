@@ -7,7 +7,7 @@ use anyhow::{Context, Result, bail};
 use argus_core::session::{
     InputControllerKind, SessionSize, StyledRow, TerminalColor, TerminalCursor, TerminalStyle,
 };
-use argus_tui::{LocalSessionApp, SessionView, session_size_from_terminal};
+use argus_tui::{CloseSessionOutcome, LocalSessionApp, SessionView, session_size_from_terminal};
 use base64::Engine;
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
@@ -220,7 +220,10 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut LocalSession
                     }
                     pending_confirmation = None;
                     selection = None;
-                    app.close_selected_session();
+                    match app.close_selected_session() {
+                        CloseSessionOutcome::ClosedLastSession => return Ok(()),
+                        CloseSessionOutcome::Closed | CloseSessionOutcome::NotClosed => {}
+                    }
                 }
                 Some(AppCommand::Next) => {
                     needs_draw = true;

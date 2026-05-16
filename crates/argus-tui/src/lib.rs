@@ -33,6 +33,13 @@ pub struct LocalSessionApp {
     last_error: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloseSessionOutcome {
+    Closed,
+    ClosedLastSession,
+    NotClosed,
+}
+
 struct SessionRuntime {
     events: SessionEventReceiver,
     view: SessionView,
@@ -103,25 +110,30 @@ impl LocalSessionApp {
         }
     }
 
-    pub fn close_selected_session(&mut self) {
-        if self.sessions.len() <= 1 {
-            self.last_error = Some("cannot close the last local session".to_string());
-            return;
-        }
+    pub fn close_selected_session(&mut self) -> CloseSessionOutcome {
+        let Some(session) = self.sessions.get(self.selected) else {
+            self.last_error = Some("no selected session to close".to_string());
+            return CloseSessionOutcome::NotClosed;
+        };
 
-        let session_id = self.sessions[self.selected].view.session_id.clone();
+        let session_id = session.view.session_id.clone();
         if let Err(error) = self.manager.shutdown_session(session_id) {
             self.last_error = Some(format!("closing selected session: {error}"));
-            return;
+            return CloseSessionOutcome::NotClosed;
         }
 
         self.sessions.remove(self.selected);
+        if self.sessions.is_empty() {
+            self.last_error = None;
+            return CloseSessionOutcome::ClosedLastSession;
+        }
 
         if self.selected >= self.sessions.len() {
             self.selected = self.sessions.len() - 1;
         }
         self.last_error = None;
         self.activate_selected_session();
+        CloseSessionOutcome::Closed
     }
 
     pub fn select_next_session(&mut self) {
@@ -1145,7 +1157,7 @@ mod tests {
         assert_eq!(app.view().session_id, first_session);
 
         app.select_next_session();
-        app.close_selected_session();
+        assert_eq!(app.close_selected_session(), CloseSessionOutcome::Closed);
 
         assert_eq!(app.sessions().len(), 1);
         assert_eq!(app.selected_index(), 0);
@@ -1216,7 +1228,7 @@ mod tests {
         )
         .expect("start daemon-backed app");
 
-        app.close_selected_session();
+        assert_eq!(app.close_selected_session(), CloseSessionOutcome::Closed);
 
         assert_eq!(app.sessions().len(), 1);
         assert_eq!(app.selected_index(), 0);
@@ -1224,6 +1236,52 @@ mod tests {
         let counts = counts.lock().expect("counts lock");
         assert_eq!(counts.shutdowns, 1);
         assert_eq!(counts.acquires, 2);
+    }
+
+    #[test]
+    fn daemon_backed_app_closing_last_session_requests_tui_exit() {
+        let counts = Arc::new(Mutex::new(RecordingCounts::default()));
+        let mut app = LocalSessionApp::start_with_manager(
+            Box::new(RecordingSessionApi {
+                counts: counts.clone(),
+                session_ids: vec![SessionId::new("session-7").expect("session id")],
+            }),
+            SessionSize::default(),
+            false,
+        )
+        .expect("start daemon-backed app");
+
+        assert_eq!(
+            app.close_selected_session(),
+            CloseSessionOutcome::ClosedLastSession
+        );
+        assert_eq!(app.sessions().len(), 0);
+
+        let counts = counts.lock().expect("counts lock");
+        assert_eq!(counts.shutdowns, 1);
+    }
+
+    #[test]
+    fn close_selected_session_reports_not_closed_without_selection() {
+        let counts = Arc::new(Mutex::new(RecordingCounts::default()));
+        let mut app = LocalSessionApp {
+            manager: Box::new(RecordingSessionApi {
+                counts: counts.clone(),
+                session_ids: Vec::new(),
+            }),
+            client_id: ClientId::new("local-tui").expect("client id"),
+            owns_sessions: false,
+            sessions: Vec::new(),
+            selected: 0,
+            current_size: SessionSize::default(),
+            last_error: None,
+        };
+
+        assert_eq!(app.close_selected_session(), CloseSessionOutcome::NotClosed);
+        assert_eq!(app.last_error(), Some("no selected session to close"));
+
+        let counts = counts.lock().expect("counts lock");
+        assert_eq!(counts.shutdowns, 0);
     }
 
     #[test]

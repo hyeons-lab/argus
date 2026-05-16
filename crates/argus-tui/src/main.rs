@@ -1040,6 +1040,8 @@ fn key_to_input(key: KeyEvent) -> Option<Vec<u8>> {
         KeyCode::Char(character) => Some(character.to_string().into_bytes()),
         KeyCode::Enter => Some(b"\r".to_vec()),
         KeyCode::Backspace => Some(vec![0x7f]),
+        KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => Some(b"\x1b[Z".to_vec()),
+        KeyCode::BackTab => Some(b"\x1b[Z".to_vec()),
         KeyCode::Tab => Some(b"\t".to_vec()),
         KeyCode::Left => Some(b"\x1b[D".to_vec()),
         KeyCode::Right => Some(b"\x1b[C".to_vec()),
@@ -1159,6 +1161,22 @@ mod tests {
         assert_eq!(
             key_to_input(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
             Some(b"\x1b".to_vec())
+        );
+        assert_eq!(
+            key_to_input(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+            Some(b"\t".to_vec())
+        );
+    }
+
+    #[test]
+    fn shift_tab_is_forwarded_as_reverse_tab() {
+        assert_eq!(
+            key_to_input(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT)),
+            Some(b"\x1b[Z".to_vec())
+        );
+        assert_eq!(
+            key_to_input(KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT)),
+            Some(b"\x1b[Z".to_vec())
         );
     }
 

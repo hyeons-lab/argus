@@ -6,7 +6,7 @@ use anyhow::Result;
 use argus_core::session::{
     AttachMode, AttachSessionRequest, ClientId, CompletedSession, InputLeaseState,
     ResizeSessionRequest, SessionApi, SessionEvent, SessionEventReceiver, SessionId, SessionSize,
-    SessionSnapshot, StartSessionRequest, StyledRowsRequest, WriteInputRequest,
+    SessionSnapshot, StartSessionRequest, StyledRow, StyledRowsRequest, WriteInputRequest,
 };
 #[cfg(unix)]
 use argus_daemon::ipc::UnixSocketClient;
@@ -210,8 +210,12 @@ impl LocalSessionApp {
                     return false;
                 };
                 if session.view.snapshot.output_seq == output_seq
-                    && response.output_seq == output_seq
                     && response.start == start
+                    && styled_rows_match_visible_text(
+                        &response.rows,
+                        &session.view.snapshot.visible_rows[start..end],
+                    )
+                    && response_matches_snapshot(output_seq, response.output_seq)
                 {
                     session.view.snapshot.styled_rows_start = response.start;
                     session.view.snapshot.styled_rows = response.rows;
@@ -605,6 +609,25 @@ fn snapshot_has_styled_range(snapshot: &SessionSnapshot, start: usize, end: usiz
     start >= styled_start && end <= styled_end
 }
 
+fn response_matches_snapshot(snapshot_output_seq: u64, response_output_seq: u64) -> bool {
+    response_output_seq >= snapshot_output_seq
+}
+
+fn styled_rows_match_visible_text(styled_rows: &[StyledRow], visible_rows: &[String]) -> bool {
+    styled_rows.len() == visible_rows.len()
+        && styled_rows
+            .iter()
+            .zip(visible_rows)
+            .all(|(styled, visible)| styled_row_text(styled).trim_end() == visible)
+}
+
+fn styled_row_text(row: &StyledRow) -> String {
+    row.spans
+        .iter()
+        .map(|span| span.text.as_str())
+        .collect::<String>()
+}
+
 pub fn session_size_from_terminal(rows: u16, cols: u16) -> SessionSize {
     SessionSize {
         rows: usize::from(rows.max(1)),
@@ -951,11 +974,52 @@ mod tests {
     }
 
     #[test]
-    fn ensure_selected_styled_rows_rejects_newer_scrollback_response() {
+    fn ensure_selected_styled_rows_accepts_newer_matching_scrollback_response() {
         let session_id = SessionId::new("session-1").expect("session id");
         let mut snapshot = test_view(session_id.clone()).snapshot;
         snapshot.output_seq = 7;
         snapshot.visible_rows = vec!["red".into(), "green".into(), "blue".into(), "white".into()];
+        let (tx, rx) = std::sync::mpsc::channel();
+        drop(tx);
+        let request = Arc::new(Mutex::new(None));
+        let mut app = LocalSessionApp {
+            manager: Box::new(StyledRowsSessionApi {
+                request: request.clone(),
+                output_seq: 8,
+            }),
+            client_id: ClientId::new("local-tui").expect("client id"),
+            owns_sessions: false,
+            sessions: vec![SessionRuntime {
+                events: rx,
+                view: SessionView {
+                    session_id,
+                    snapshot,
+                    lease: InputLeaseState::default(),
+                    last_completed: None,
+                    scroll_offset: 2,
+                },
+            }],
+            selected: 0,
+            current_size: SessionSize::default(),
+            last_error: None,
+        };
+
+        assert!(app.ensure_selected_styled_rows(2));
+        assert_eq!(app.view().snapshot.styled_rows_start, 0);
+        assert_eq!(app.view().snapshot.styled_rows.len(), 2);
+    }
+
+    #[test]
+    fn ensure_selected_styled_rows_rejects_newer_mismatched_scrollback_response() {
+        let session_id = SessionId::new("session-1").expect("session id");
+        let mut snapshot = test_view(session_id.clone()).snapshot;
+        snapshot.output_seq = 7;
+        snapshot.visible_rows = vec![
+            "changed".into(),
+            "green".into(),
+            "blue".into(),
+            "white".into(),
+        ];
         let (tx, rx) = std::sync::mpsc::channel();
         drop(tx);
         let request = Arc::new(Mutex::new(None));

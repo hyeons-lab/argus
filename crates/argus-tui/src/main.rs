@@ -220,7 +220,9 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut LocalSession
                     }
                     pending_confirmation = None;
                     selection = None;
-                    app.close_selected_session();
+                    if app.close_selected_session() {
+                        return Ok(());
+                    }
                 }
                 Some(AppCommand::Next) => {
                     needs_draw = true;

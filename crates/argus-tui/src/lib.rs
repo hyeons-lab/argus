@@ -103,25 +103,25 @@ impl LocalSessionApp {
         }
     }
 
-    pub fn close_selected_session(&mut self) {
-        if self.sessions.len() <= 1 {
-            self.last_error = Some("cannot close the last local session".to_string());
-            return;
-        }
-
+    pub fn close_selected_session(&mut self) -> bool {
         let session_id = self.sessions[self.selected].view.session_id.clone();
         if let Err(error) = self.manager.shutdown_session(session_id) {
             self.last_error = Some(format!("closing selected session: {error}"));
-            return;
+            return false;
         }
 
         self.sessions.remove(self.selected);
+        if self.sessions.is_empty() {
+            self.last_error = None;
+            return true;
+        }
 
         if self.selected >= self.sessions.len() {
             self.selected = self.sessions.len() - 1;
         }
         self.last_error = None;
         self.activate_selected_session();
+        false
     }
 
     pub fn select_next_session(&mut self) {
@@ -1145,7 +1145,7 @@ mod tests {
         assert_eq!(app.view().session_id, first_session);
 
         app.select_next_session();
-        app.close_selected_session();
+        assert!(!app.close_selected_session());
 
         assert_eq!(app.sessions().len(), 1);
         assert_eq!(app.selected_index(), 0);
@@ -1216,7 +1216,7 @@ mod tests {
         )
         .expect("start daemon-backed app");
 
-        app.close_selected_session();
+        assert!(!app.close_selected_session());
 
         assert_eq!(app.sessions().len(), 1);
         assert_eq!(app.selected_index(), 0);
@@ -1224,6 +1224,26 @@ mod tests {
         let counts = counts.lock().expect("counts lock");
         assert_eq!(counts.shutdowns, 1);
         assert_eq!(counts.acquires, 2);
+    }
+
+    #[test]
+    fn daemon_backed_app_closing_last_session_requests_tui_exit() {
+        let counts = Arc::new(Mutex::new(RecordingCounts::default()));
+        let mut app = LocalSessionApp::start_with_manager(
+            Box::new(RecordingSessionApi {
+                counts: counts.clone(),
+                session_ids: vec![SessionId::new("session-7").expect("session id")],
+            }),
+            SessionSize::default(),
+            false,
+        )
+        .expect("start daemon-backed app");
+
+        assert!(app.close_selected_session());
+        assert_eq!(app.sessions().len(), 0);
+
+        let counts = counts.lock().expect("counts lock");
+        assert_eq!(counts.shutdowns, 1);
     }
 
     #[test]

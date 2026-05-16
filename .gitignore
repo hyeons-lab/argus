@@ -11,3 +11,5 @@ worktrees/
 # Editor
 *.swp
 *.swo
+# Added by code-review-graph
+.code-review-graph/

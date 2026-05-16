@@ -92,7 +92,17 @@ enum StartupMode {
 }
 
 impl StartupMode {
-    const HELP: &'static str = "usage: argus-tui [--socket <path>] [--embedded]\n\nBy default argus-tui connects to the daemon Unix socket on Unix and uses embedded development mode on non-Unix platforms. Use --embedded on Unix only for isolated development.";
+    const HELP: &'static str = "\
+usage: argus-tui [--socket <path>] [--embedded]
+
+Options:
+  --socket <path>  Connect to a daemon Unix socket at <path>
+  --embedded       Run an isolated in-process session manager
+  -h, --help       Print this help text
+
+By default argus-tui connects to the daemon Unix socket on Unix and uses
+embedded development mode on non-Unix platforms. Use --embedded on Unix only
+for isolated development.";
 
     fn from_args(args: impl IntoIterator<Item = OsString>) -> Result<Self> {
         let mut mode = None;
@@ -103,30 +113,32 @@ impl StartupMode {
             match arg.to_str() {
                 Some("--embedded") => {
                     if mode.replace(StartupMode::Embedded).is_some() {
-                        bail!("--embedded can only be passed once");
+                        bail!("--embedded can only be passed once; pass --help for usage");
                     }
                 }
                 Some("--socket") => {
                     if socket_path.is_some() {
-                        bail!("--socket can only be passed once");
+                        bail!("--socket can only be passed once; pass --help for usage");
                     }
                     let Some(path) = args.next() else {
-                        bail!("--socket requires a path");
+                        bail!("--socket requires a path; pass --help for usage");
                     };
                     socket_path = Some(PathBuf::from(path));
                 }
                 Some("--help") | Some("-h") => return Ok(StartupMode::Help),
-                Some(flag) if flag.starts_with('-') => bail!("unknown option {flag}"),
-                Some(value) => bail!("unexpected argument {value}"),
+                Some(flag) if flag.starts_with('-') => {
+                    bail!("unknown option {flag}; pass --help for usage")
+                }
+                Some(value) => bail!("unexpected argument {value}; pass --help for usage"),
                 None => bail!(
-                    "unexpected non-UTF-8 argument {}; pass socket paths with --socket",
+                    "unexpected non-UTF-8 argument {}; pass socket paths with --socket or pass --help for usage",
                     display_os_str(&arg)
                 ),
             }
         }
 
         if mode == Some(StartupMode::Embedded) && socket_path.is_some() {
-            bail!("--embedded cannot be combined with --socket");
+            bail!("--embedded cannot be combined with --socket; pass --help for usage");
         }
 
         if let Some(mode) = mode {
@@ -269,6 +281,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut LocalSession
                 needs_draw = true;
                 pending_confirmation = None;
                 selection = None;
+                app.refresh_selected_snapshot();
                 app.write_input(paste_input(
                     &text,
                     app.view().snapshot.bracketed_paste_enabled,
@@ -394,7 +407,7 @@ fn draw_terminal(
     let end = start
         .saturating_add(visible_height)
         .min(view.snapshot.visible_rows.len());
-    let render_cols = terminal_render_cols(area, view.snapshot.size.cols);
+    let render_cols = terminal_render_cols(area);
     let selection = selection
         .filter(|selection| selection.is_active())
         .map(|selection| selection.to_visible_range(start));
@@ -424,7 +437,7 @@ fn draw_terminal(
     }
 }
 
-fn terminal_render_cols(area: Rect, _snapshot_cols: usize) -> usize {
+fn terminal_render_cols(area: Rect) -> usize {
     usize::from(area.width)
 }
 
@@ -612,9 +625,7 @@ fn selected_text(view: &SessionView, area: Rect, selection: TerminalSelection) -
         .enumerate()
         .skip(selection.start.row)
         .take(selection.end.row.saturating_sub(selection.start.row) + 1)
-        .filter_map(|(row_index, row)| {
-            selected_row_text(row, row_index, selection).map(|line| line.trim_end().to_string())
-        })
+        .filter_map(|(row_index, row)| selected_row_text(row, row_index, selection))
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -1044,9 +1055,10 @@ fn paste_input(text: &str, bracketed_paste_enabled: bool) -> Vec<u8> {
         return text.as_bytes().to_vec();
     }
 
-    let mut bytes = Vec::with_capacity(b"\x1b[200~".len() + text.len() + b"\x1b[201~".len());
+    let sanitized = text.replace("\x1b[201~", "");
+    let mut bytes = Vec::with_capacity(b"\x1b[200~".len() + sanitized.len() + b"\x1b[201~".len());
     bytes.extend_from_slice(b"\x1b[200~");
-    bytes.extend_from_slice(text.as_bytes());
+    bytes.extend_from_slice(sanitized.as_bytes());
     bytes.extend_from_slice(b"\x1b[201~");
     bytes
 }
@@ -1232,6 +1244,14 @@ mod tests {
     }
 
     #[test]
+    fn paste_input_strips_embedded_bracketed_paste_end_marker() {
+        assert_eq!(
+            paste_input("safe\x1b[201~still pasted", true),
+            b"\x1b[200~safestill pasted\x1b[201~"
+        );
+    }
+
+    #[test]
     fn session_size_matches_terminal_pane_inner_area() {
         let size = session_size_from_app_terminal(24, 100, true);
 
@@ -1290,6 +1310,44 @@ mod tests {
     }
 
     #[test]
+    fn terminal_selection_preserves_selected_trailing_spaces() {
+        let view = SessionView {
+            session_id: argus_core::session::SessionId::new("session-1").expect("session id"),
+            snapshot: argus_core::session::SessionSnapshot {
+                output_seq: 0,
+                bytes_logged: 0,
+                size: SessionSize::default(),
+                visible_rows: vec!["cmd   ".to_string(), "next".to_string()],
+                styled_rows_start: 0,
+                styled_rows: Vec::new(),
+                cursor: argus_core::session::TerminalCursor {
+                    row: 0,
+                    col: 0,
+                    visible: false,
+                },
+                current_working_directory: None,
+                bracketed_paste_enabled: false,
+                exited: false,
+            },
+            lease: argus_core::session::InputLeaseState::default(),
+            last_completed: None,
+            scroll_offset: 0,
+        };
+        let area = Rect {
+            x: SIDEBAR_COLS,
+            y: 0,
+            width: 20,
+            height: 2,
+        };
+        let selection = TerminalSelection {
+            start: TerminalPoint { col: 0, row: 0 },
+            end: TerminalPoint { col: 1, row: 1 },
+        };
+
+        assert_eq!(selected_text(&view, area, selection), "cmd   \nne");
+    }
+
+    #[test]
     fn terminal_selection_middle_rows_stop_at_row_text() {
         let row_index = 1;
         let selection = VisibleSelection {
@@ -1342,14 +1400,14 @@ mod tests {
     fn terminal_render_cols_expands_to_terminal_pane_width() {
         let area = Rect::new(0, 0, 102, 24);
 
-        assert_eq!(terminal_render_cols(area, 80), 102);
+        assert_eq!(terminal_render_cols(area), 102);
     }
 
     #[test]
     fn terminal_render_cols_uses_terminal_pane_width_when_snapshot_is_wider() {
         let area = Rect::new(0, 0, 72, 24);
 
-        assert_eq!(terminal_render_cols(area, 100), 72);
+        assert_eq!(terminal_render_cols(area), 72);
     }
 
     #[test]

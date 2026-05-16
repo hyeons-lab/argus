@@ -63,6 +63,7 @@
 - Added sequenced session event envelopes, cursor-based subscription replay, and an explicit resync event so slow subscribers can catch up from the daemon replay buffer instead of losing terminal lifecycle state behind output bursts.
 - Relaxed scrolled-back styled-row refreshes to accept newer daemon style responses for stable history ranges, preserving colors while output continues below the visible scrollback window.
 - Resized every open, non-exited TUI session after a terminal resize so inactive PTYs do not keep stale rows and columns.
+- Addressed follow-up PR review feedback by sanitizing embedded bracketed-paste end markers, refreshing the selected snapshot before paste, preserving selected trailing spaces, rejecting stale styled-row responses, clearing overlong unterminated OSC 7 buffers, making cursor visibility explicit, and removing dead attach/render parameters.
 
 ## Commits
 - 472806b — feat: make TUI daemon-first
@@ -74,7 +75,8 @@
 - f41bb6e — fix: restore paste and color behavior
 - aab5126 — fix: preserve exited session colors
 - f67b7ac — fix: address daemon TUI review feedback
-- HEAD — fix: improve daemon TUI scrollback responsiveness
+- aba5835 — fix: improve daemon TUI scrollback responsiveness
+- HEAD — fix: address TUI review follow-ups
 
 ## Progress
 - 2026-05-14T18:00-0700 — Created `feat/daemon-first-tui` worktree from `origin/main`, unset the accidental upstream, and inspected the current TUI socket fallback.
@@ -150,3 +152,5 @@
 - 2026-05-15T20:43-0700 — Validation passed: `cargo fmt --all`, focused replay/scrollback color tests, and `/home/dberrios/.cargo/bin/cargo test -p argus-tui -p argus-daemon`.
 - 2026-05-15T21:33-0700 — Addressed review feedback by making the default TUI shell bootstrap POSIX-compatible under `/bin/sh`, replacing bash-only prompt path substitutions with a `sed`-based escape pipeline and adding `/bin/sh` syntax coverage.
 - 2026-05-15T21:33-0700 — Validation passed: `cargo fmt --all -- --check`, `/home/dberrios/.cargo/bin/cargo test -p argus-tui default_shell`, and `/home/dberrios/.cargo/bin/cargo test -p argus-tui`.
+- 2026-05-15T22:34-0700 — Addressed unresolved PR review feedback by sanitizing bracketed paste payload terminators, refreshing paste-time snapshot state, preserving selected trailing whitespace, requiring styled-row responses to match the cached output sequence, clearing overlong unterminated OSC 7 cwd buffers, and removing dead attach/render parameters.
+- 2026-05-15T22:34-0700 — Validation passed: `cargo fmt --all -- --check`, `cargo check -p argus-daemon -p argus-tui`, `cargo test -p argus-tui paste_input --locked`, `cargo test -p argus-tui terminal_selection --locked`, `cargo test -p argus-tui ensure_selected_styled_rows --locked`, `cargo test -p argus-daemon output_state_bounds_unterminated_osc7_working_directory --locked`, `cargo clippy -p argus-daemon -p argus-tui --all-targets --all-features --locked -- -D warnings`, and `cargo test -p argus-tui -p argus-daemon --locked`.

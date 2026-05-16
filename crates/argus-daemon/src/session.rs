@@ -1043,8 +1043,7 @@ impl OutputState {
         }
 
         if self.cwd_sequence_buffer.len() > MAX_OSC_BUFFER {
-            let keep_from = self.cwd_sequence_buffer.len() - MAX_OSC_BUFFER;
-            self.cwd_sequence_buffer.drain(..keep_from);
+            self.cwd_sequence_buffer.clear();
         }
 
         current_working_directory
@@ -1311,7 +1310,10 @@ fn terminal_cursor(terminal: &Terminal) -> TerminalCursor {
             .saturating_sub(screen.physical_rows)
             + cursor.y.max(0) as usize,
         col: cursor.x,
-        visible: cursor.visibility == Default::default(),
+        visible: matches!(
+            cursor.visibility,
+            wezterm_surface::CursorVisibility::Visible
+        ),
     }
 }
 
@@ -1544,7 +1546,7 @@ mod tests {
             .ingest(&vec![b'a'; MAX_OSC_BUFFER * 2])
             .expect("ingest unterminated OSC 7 payload");
 
-        assert!(output.cwd_sequence_buffer.len() <= MAX_OSC_BUFFER);
+        assert!(output.cwd_sequence_buffer.is_empty());
         let _ = std::fs::remove_file(log_path);
     }
 

@@ -63,7 +63,7 @@ impl LocalSessionApp {
         let mut sessions = if owns_sessions {
             Vec::new()
         } else {
-            attach_existing_sessions(manager.as_ref(), &client_id, size.clone())?
+            attach_existing_sessions(manager.as_ref(), &client_id)?
         };
 
         if sessions.is_empty() {
@@ -209,11 +209,8 @@ impl LocalSessionApp {
                 let Some(session) = self.sessions.get_mut(self.selected) else {
                     return false;
                 };
-                let is_scrollback_range = end < session.view.snapshot.visible_rows.len();
-                let response_matches_snapshot = response.output_seq == output_seq
-                    || (is_scrollback_range && response.output_seq >= output_seq);
                 if session.view.snapshot.output_seq == output_seq
-                    && response_matches_snapshot
+                    && response.output_seq == output_seq
                     && response.start == start
                 {
                     session.view.snapshot.styled_rows_start = response.start;
@@ -298,6 +295,24 @@ impl LocalSessionApp {
             self.last_error = Some(error.to_string());
         } else {
             self.last_error = None;
+        }
+    }
+
+    pub fn refresh_selected_snapshot(&mut self) -> bool {
+        let Some(session) = self.sessions.get_mut(self.selected) else {
+            return false;
+        };
+        let session_id = session.view.session_id.clone();
+        match self.manager.snapshot_session(session_id) {
+            Ok(snapshot) => {
+                replace_snapshot_preserving_scroll(&mut session.view, snapshot);
+                self.last_error = None;
+                true
+            }
+            Err(error) => {
+                self.last_error = Some(format!("refreshing selected session snapshot: {error}"));
+                true
+            }
         }
     }
 
@@ -425,7 +440,6 @@ impl LocalSessionApp {
 fn attach_existing_sessions(
     manager: &dyn SessionApi,
     client_id: &ClientId,
-    _size: SessionSize,
 ) -> Result<Vec<SessionRuntime>> {
     let mut sessions = Vec::new();
 
@@ -937,7 +951,7 @@ mod tests {
     }
 
     #[test]
-    fn ensure_selected_styled_rows_keeps_scrollback_colors_when_output_advances() {
+    fn ensure_selected_styled_rows_rejects_newer_scrollback_response() {
         let session_id = SessionId::new("session-1").expect("session id");
         let mut snapshot = test_view(session_id.clone()).snapshot;
         snapshot.output_seq = 7;
@@ -967,9 +981,8 @@ mod tests {
             last_error: None,
         };
 
-        assert!(app.ensure_selected_styled_rows(2));
-        assert_eq!(app.view().snapshot.styled_rows_start, 0);
-        assert_eq!(app.view().snapshot.styled_rows[0].spans[0].text, "red");
+        assert!(!app.ensure_selected_styled_rows(2));
+        assert!(app.view().snapshot.styled_rows.is_empty());
     }
 
     #[test]

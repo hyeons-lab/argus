@@ -102,7 +102,48 @@ pub struct SessionSnapshot {
     pub bytes_logged: u64,
     pub size: SessionSize,
     pub visible_rows: Vec<String>,
+    pub styled_rows_start: usize,
+    pub styled_rows: Vec<StyledRow>,
+    pub cursor: TerminalCursor,
+    pub current_working_directory: Option<PathBuf>,
+    pub bracketed_paste_enabled: bool,
     pub exited: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalCursor {
+    pub row: usize,
+    pub col: usize,
+    pub visible: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StyledRow {
+    pub spans: Vec<StyledSpan>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StyledSpan {
+    pub text: String,
+    pub style: TerminalStyle,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalStyle {
+    pub foreground: Option<TerminalColor>,
+    pub background: Option<TerminalColor>,
+    pub bold: bool,
+    pub dim: bool,
+    pub italic: bool,
+    pub underline: bool,
+    pub reverse: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalColor {
+    pub red: u8,
+    pub green: u8,
+    pub blue: u8,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -268,6 +309,20 @@ pub struct ResizeSessionRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StyledRowsRequest {
+    pub session_id: SessionId,
+    pub start: usize,
+    pub end: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StyledRowsResponse {
+    pub output_seq: u64,
+    pub start: usize,
+    pub rows: Vec<StyledRow>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InputLeaseRequest {
     pub session_id: SessionId,
     pub client_id: ClientId,
@@ -276,6 +331,11 @@ pub struct InputLeaseRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SessionEvent {
+    ResyncRequired {
+        session_id: SessionId,
+        latest_event_seq: u64,
+        snapshot: SessionSnapshot,
+    },
     Output {
         session_id: SessionId,
         output_seq: u64,
@@ -295,12 +355,34 @@ pub enum SessionEvent {
     },
 }
 
-pub type SessionEventReceiver = Receiver<SessionEvent>;
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionEventEnvelope {
+    pub event_seq: u64,
+    pub event: SessionEvent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubscribeSessionEventsRequest {
+    pub session_id: SessionId,
+    pub after_event_seq: Option<u64>,
+}
+
+pub type SessionEventReceiver = Receiver<SessionEventEnvelope>;
 
 pub trait SessionApi {
+    fn list_sessions(&self) -> Result<Vec<SessionId>>;
     fn start_session(&self, request: StartSessionRequest) -> Result<SessionId>;
     fn attach_session(&self, request: AttachSessionRequest) -> Result<AttachSessionResponse>;
     fn subscribe_session_events(&self, session_id: SessionId) -> Result<SessionEventReceiver>;
+    fn subscribe_session_events_from(
+        &self,
+        request: SubscribeSessionEventsRequest,
+    ) -> Result<SessionEventReceiver> {
+        if request.after_event_seq.is_some() {
+            anyhow::bail!("event replay is not supported by this session API");
+        }
+        self.subscribe_session_events(request.session_id)
+    }
     fn acquire_input_lease(&self, request: InputLeaseRequest) -> Result<LeaseChange>;
     fn release_input_lease(
         &self,
@@ -310,6 +392,7 @@ pub trait SessionApi {
     fn write_input(&self, request: WriteInputRequest) -> Result<()>;
     fn resize_session(&self, request: ResizeSessionRequest) -> Result<SessionSnapshot>;
     fn snapshot_session(&self, session_id: SessionId) -> Result<SessionSnapshot>;
+    fn styled_rows(&self, request: StyledRowsRequest) -> Result<StyledRowsResponse>;
     fn shutdown_session(&self, session_id: SessionId) -> Result<CompletedSession>;
 }
 

@@ -1,0 +1,164 @@
+# feat/daemon-first-tui
+
+## Agent
+- Codex
+
+## Intent
+- Make the local TUI daemon-backed by default now that the Unix socket session API has landed.
+- Keep the embedded session manager path available only as an explicit development mode.
+
+## Decisions
+- Avoid silent fallback from daemon startup errors because it can hide daemon/socket regressions and split session ownership between two managers.
+- Use a small built-in CLI parser for this slice instead of adding a command-line dependency.
+
+## What Changed
+- Made the TUI connect to the daemon Unix socket by default instead of falling back to an embedded manager on connection or startup errors.
+- Added explicit `--embedded` and `--socket <path>` startup options with parser coverage.
+- Marked the local Unix socket adapter complete in the design roadmap.
+- Fixed PR review follow-ups so `--help` exits successfully, non-Unix TUI startup defaults to embedded mode as the supported workaround, and both ambiguous `--embedded`/`--socket` orderings are covered.
+- Added daemon snapshot cwd metadata and styled rows, made `Ctrl-N` start a new session from the selected session cwd, and rendered styled terminal spans in the TUI.
+- Preserved background-styled blank cells from terminal clear-to-end sequences so Codex's grey composer/input rows survive daemon snapshots.
+- Added an `F2` TUI sidebar toggle and resized the active session when the sidebar is hidden or restored.
+- Made daemon-mode TUI exit detach without shutting down sessions and added repeat-key confirmation for destructive closes.
+- Forwarded terminal-emulator responses back into the PTY so child TUIs can query default foreground/background colors.
+- Added daemon session listing and TUI reattach-on-start so existing daemon sessions show up after restarting the TUI.
+- Filled blank styled rows between matching background rows to avoid black gaps inside Codex's grey input box.
+- Collapsed blank separator rows between matching background-styled rows so Codex's grey input box does not render an extra empty line.
+- Padded styled terminal rows to the rendered TUI pane width so background-colored input rows do not stop at the daemon snapshot width.
+- Forwarded `Esc` to the child terminal and kept `Ctrl-Q` as the Argus exit shortcut so child TUIs can consume Escape first.
+- Collapsed blank separator rows even when the separator row carries a different background, as long as the surrounding nonblank rows share the same background.
+- Compared only background/reverse attributes when collapsing blank separator rows so foreground differences do not keep Codex's grey input row split.
+- Disabled Ratatui paragraph wrapping for terminal output and padded rows only to the visible pane width so stale/wider snapshots cannot wrap into an extra full-width row.
+- Removed blank-row deletion from TUI projection, forwarded only key press events to child terminals, and carried terminal cursor coordinates through snapshots so child TUI input stays in place.
+- Suppressed default info-level `wezterm_term` bell logs so child BEL output does not leak "Ding!" diagnostics into Argus terminal sessions.
+- Reattached daemon sessions as observers, then acquired the input lease and resized only the selected session so startup does not mutate background sessions.
+- Cleared stale styled rows on exit events, preserved terminal dim/faint intensity for placeholder hint text, and chained an existing `PROMPT_COMMAND` when installing OSC 7 cwd reporting.
+- Removed the terminal pane border/title, adjusted PTY sizing and cursor math for the unframed pane, and added mouse wheel plus PageUp/PageDown scrollback for the selected session.
+- Returned retained daemon terminal scrollback in session snapshots and adjusted cursor rows into that scrollback-backed coordinate space so manual TUI scrolling has history to display.
+- Removed the top, left, and bottom border from the sessions sidebar so only the terminal separator remains.
+- Suppressed expected Unix socket disconnect logs so dropped TUI event subscriptions do not look like daemon failures or corrupt a co-located TUI display.
+- Bounded unterminated OSC 7 cwd parsing buffers and gave each TUI app instance a unique local client id so daemon input leases are not shared by simultaneous TUIs.
+- Removed terminal mouse capture so the terminal emulator keeps ownership of text selection and copy/paste; PageUp/PageDown remain the TUI scrollback controls.
+- Restored terminal mouse capture and routed mouse wheel events to selected-session scrollback so wheel input does not reach the child shell as history navigation.
+- Removed terminal mouse capture again because native terminal text selection and copy/paste are higher priority than mouse-wheel TUI scrollback; PageUp/PageDown remain available for Argus scrollback.
+- Reintroduced TUI-owned mouse mode with pane-local wheel scrolling, visual terminal-pane selection, and OSC 52 clipboard copy so selection cannot include the sessions sidebar.
+- Made `Ctrl-C` copy and clear an active terminal-pane selection instead of forwarding interrupt input to the child process; `Ctrl-C` still forwards normally when there is no selection.
+- Normalized bare line-feed bytes to CRLF only for the daemon terminal model so hook/status output with `\n` separators renders as separate left-aligned rows while raw PTY logs stay unchanged.
+- Reduced scrollback-heavy render latency by drawing only the visible TUI pane rows and limiting expensive styled snapshot rows to the daemon terminal's live physical viewport.
+- Preserved the visible scrollback anchor when new daemon snapshots append rows while the TUI is scrolled back; views at the bottom still follow new output.
+- Enabled bracketed paste mode and forwarded paste payloads as a single input write so pasted text appears in the child terminal without per-character animation.
+- Restored styled snapshots for the full retained terminal row set so background and foreground colors render in both live output and scrollback.
+- Restored raw PTY line-feed handling in the daemon terminal model and wrapped outer Crossterm paste events with bracketed paste markers before forwarding them to child applications.
+- Decoded percent-escaped OSC 7 file URI paths before storing daemon session cwd metadata.
+- Forwarded paste payloads raw unless the daemon terminal snapshot says the child enabled bracketed paste, and percent-encoded cwd paths before emitting OSC 7.
+- Refreshed a final styled daemon snapshot after exit events so live TUI views keep terminal colors the same way reattached views do.
+- Made terminal mouse selection activate only after a drag so a plain click does not draw a reversed cell or switch the terminal pane to unstyled selection rendering.
+- Preserved styled terminal spans during active text selection by applying selection highlighting on top of foreground and background colors.
+- Addressed PR review and typing-latency feedback by lowering the TUI event poll interval, avoiding cwd OSC scans for ordinary output chunks, tightening selection bounds, replacing manual Base64 encoding, narrowing closed-socket suppression, and making style/sidebar calculations less fragile.
+- Kept event subscribers attached when their output notification buffer fills, dropping only the saturated notification instead of treating backpressure as a disconnect.
+- Profiled the terminal output hot path and reduced repeated snapshot cost by limiting styled snapshot rows to the live viewport while preserving full plain scrollback rows for scrolling.
+- Made the TUI render loop dirty-driven so it does not redraw every poll tick when there are no session, input, resize, paste, or mouse changes.
+- Added a range-based styled terminal row API so the TUI can lazily fetch colors for the currently visible scrollback range without rebuilding styled spans for the full retained history on every snapshot.
+- Updated the TUI render path to refill the selected tab's styled range before drawing scrolled history, preserving colored terminal scrollback while keeping output snapshots live-viewport sized.
+- Added sequenced session event envelopes, cursor-based subscription replay, and an explicit resync event so slow subscribers can catch up from the daemon replay buffer instead of losing terminal lifecycle state behind output bursts.
+- Relaxed scrolled-back styled-row refreshes to accept newer daemon style responses for stable history ranges, preserving colors while output continues below the visible scrollback window.
+- Resized every open, non-exited TUI session after a terminal resize so inactive PTYs do not keep stale rows and columns.
+- Addressed follow-up PR review feedback by sanitizing embedded bracketed-paste end markers, refreshing the selected snapshot before paste, preserving selected trailing spaces, rejecting stale styled-row responses, clearing overlong unterminated OSC 7 buffers, making cursor visibility explicit, and removing dead attach/render parameters.
+- Added focused regression coverage showing dropped event subscribers are pruned on the next actor flush and overlong aborted OSC 7 cwd payloads do not poison later cwd updates.
+- Restored colored scrollback while output continues by accepting newer styled-row responses only when their plain text still matches the cached visible rows.
+
+## Commits
+- 472806b — feat: make TUI daemon-first
+- 1c53b54 — fix: clean up TUI startup options
+- 45ce48d — fix: preserve TUI session cwd and styles
+- d93e7fc — fix: restore TUI mouse wheel scrollback
+- bf8d127 — fix: satisfy daemon IPC clippy lint
+- abfe7b9 — fix: polish terminal selection and rendering
+- f41bb6e — fix: restore paste and color behavior
+- aab5126 — fix: preserve exited session colors
+- f67b7ac — fix: address daemon TUI review feedback
+- aba5835 — fix: improve daemon TUI scrollback responsiveness
+- 1bcc739 — fix: address TUI review follow-ups
+- 4bf603e — test: cover daemon review edge cases
+- HEAD — fix: restore colored scrollback
+
+## Progress
+- 2026-05-14T18:00-0700 — Created `feat/daemon-first-tui` worktree from `origin/main`, unset the accidental upstream, and inspected the current TUI socket fallback.
+- 2026-05-14T18:03-0700 — Implemented daemon-first TUI startup, kept embedded mode opt-in, updated roadmap status, and completed local validation.
+- 2026-05-14T18:03-0700 — Validation passed: `cargo fmt --all -- --check`, `cargo check --workspace`, `cargo test -p argus-tui`, `/home/dberrios/.cargo/bin/cargo test --workspace`, `cargo clippy --all-targets --all-features -- -D warnings`, and `git diff --check`.
+- 2026-05-14T18:18-0700 — Addressed PR review feedback: clean help exit, Windows/non-Unix embedded default workaround, and extra parser coverage for reverse ambiguous option ordering.
+- 2026-05-14T18:18-0700 — Validation passed after review fixes: `cargo run -q -p argus-tui -- --help`, `cargo fmt --all -- --check`, `cargo check --workspace`, `cargo test -p argus-tui`, `/home/dberrios/.cargo/bin/cargo test --workspace`, `cargo clippy --all-targets --all-features -- -D warnings`, and `git diff --check`.
+- 2026-05-14T18:25-0700 — Fixed the Windows CI regression by making the default-startup parser test assert the platform-specific default: daemon socket on Unix and embedded mode on non-Unix.
+- 2026-05-14T18:48-0700 — Added selected-session cwd inheritance for new TUI tabs and styled terminal-row rendering so colorized sessions are not flattened to plain text.
+- 2026-05-14T18:48-0700 — Validation passed for the follow-up: `cargo check --workspace`, `/home/dberrios/.cargo/bin/cargo test --workspace` with escalated Unix socket permissions, `cargo clippy --all-targets --all-features -- -D warnings`, and `git diff --check`.
+- 2026-05-14T18:59-0700 — Preserved trailing styled cells so full-row backgrounds and prompt input boxes keep their background color instead of being trimmed to text width.
+- 2026-05-14T19:04-0700 — Padded TUI styled rows with the trailing background/reverse style to the session width so Codex input boxes keep their background even when the terminal model does not materialize every trailing cell.
+- 2026-05-14T19:08-0700 — Applied the trailing background/reverse style to the Ratatui line itself so row backgrounds are painted across the full terminal row, not only under explicit spans.
+- 2026-05-14T19:16-0700 — Inspected OpenAI Codex's TUI renderer and matched its background-colored clear-to-end output by snapshotting physical terminal cells, including styled blanks.
+- 2026-05-14T19:17-0700 — Added an `F2` sidebar toggle so the terminal pane can reclaim the session-list columns on narrow screens.
+- 2026-05-14T19:22-0700 — Split daemon-mode exit from session shutdown and added confirmation for destructive terminal close/embedded exit.
+- 2026-05-14T19:31-0700 — Fixed dropped terminal query responses; Codex needs OSC 10/11 default-color replies before it chooses the grey composer background.
+- 2026-05-14T19:40-0700 — Filled blank rows between matching background-styled rows so Codex's grey input box is not split by a black row.
+- 2026-05-14T19:43-0700 — Added session listing through the daemon API and made daemon-backed TUI startup reattach existing sessions instead of always starting a new one.
+- 2026-05-14T19:50-0700 — Collapsed matching blank separator rows instead of painting them, removing the extra empty line inside Codex's grey input area.
+- 2026-05-14T19:57-0700 — Padded styled rows to the TUI pane width as well as the daemon snapshot width, addressing a remaining right-side gap in Codex's grey input row.
+- 2026-05-14T19:59-0700 — Forwarded Escape to child terminals, updated the exit hint to `Ctrl-Q`, and relaxed blank separator collapse to handle a differently styled gap row between matching grey input rows.
+- 2026-05-14T20:02-0700 — Made blank separator collapse compare background/reverse only, so differing foreground/cursor attributes above and below the gap do not prevent removal.
+- 2026-05-14T20:06-0700 — Disabled outer paragraph wrapping for the terminal pane and made styled row padding use the visible pane width, preventing over-wide snapshots from rendering as extra full-width visual rows.
+- 2026-05-14T22:09-0700 — Reverted blank-row collapse to preserve terminal geometry, filtered non-press key events to avoid duplicate child input, and added cursor position metadata from the daemon terminal model to the TUI renderer.
+- 2026-05-14T22:15-0700 — Raised the default log filter for `wezterm_term::terminalstate::performer` bell diagnostics to warn, keeping BEL events out of default daemon console/file logs.
+- 2026-05-14T22:25-0700 — Addressed critical review findings and manual TUI feedback: daemon reattach observes background sessions, selected-session activation owns lease/resize, exit events drop stale styles, dim text remains dim, the terminal pane is unframed, and mouse wheel/PageUp/PageDown scroll the displayed session.
+- 2026-05-14T22:25-0700 — Validation passed: `cargo fmt --all -- --check`, `/home/dberrios/.cargo/bin/cargo test -p argus-tui -p argus-daemon`, and `cargo clippy --all-targets --all-features -- -D warnings`.
+- 2026-05-14T22:31-0700 — Fixed manual scrollback by snapshotting retained daemon terminal rows instead of only the physical viewport, with cursor coordinates rebased for the longer row list.
+- 2026-05-14T22:47-0700 — Removed the top, left, and bottom border from the sessions sidebar, leaving only the right separator.
+- 2026-05-14T22:50-0700 — Treated broken-pipe/reset/EOF Unix socket writes as expected client disconnects and added coverage for context-wrapped broken-pipe detection.
+- 2026-05-15T07:01-0700 — Addressed review findings by keeping OSC 7 buffer trimming on the unterminated path and generating per-app TUI client ids for daemon leases.
+- 2026-05-15T07:01-0700 — Validation passed: `/home/dberrios/.cargo/bin/cargo test -p argus-daemon -p argus-tui`.
+- 2026-05-15T07:07-0700 — Suppressed expected broken-pipe/reset/EOF Unix socket disconnect logging entirely so verbose daemon output cannot overwrite the TUI screen.
+- 2026-05-15T07:18-0700 — Removed terminal mouse capture so normal terminal copy/paste selection works in Argus, keeping PageUp/PageDown for scrollback, and reacquired the input lease after closing the selected daemon-backed session.
+- 2026-05-15T07:29-0700 — Restored terminal mouse capture and handled scroll-wheel events in the TUI event loop so mouse scrolling moves Argus scrollback instead of the child shell input history.
+- 2026-05-15T07:30-0700 — Validation passed: `cargo fmt --all -- --check` and `/home/dberrios/.cargo/bin/cargo test -p argus-tui -p argus-daemon`.
+- 2026-05-15T07:32-0700 — Fixed CI's `clippy::collapsible-if` warning in the Unix socket disconnect handler after the pushed run failed in Format and Lint.
+- 2026-05-15T07:33-0700 — Validation passed: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`, and `/home/dberrios/.cargo/bin/cargo test -p argus-tui -p argus-daemon`.
+- 2026-05-15T07:39-0700 — Checked PR #17 CI: Format and Lint plus macOS, Ubuntu, and Windows tests all passed. Removed TUI mouse capture again after manual copy/selection feedback, accepting keyboard-only Argus scrollback controls for now.
+- 2026-05-15T07:49-0700 — Rechecked PR #17 CI: Format and Lint plus macOS, Ubuntu, and Windows tests all passed. Implemented pane-local mouse handling so wheel events scroll Argus history while drag selection is clamped to the terminal pane and copied via OSC 52 on mouse release.
+- 2026-05-15T07:49-0700 — Validation passed: `cargo fmt --all -- --check`, `/home/dberrios/.cargo/bin/cargo test -p argus-tui`, `cargo clippy -p argus-tui --all-targets --all-features --locked -- -D warnings`, and `/home/dberrios/.cargo/bin/cargo test -p argus-daemon`.
+- 2026-05-15T08:27-0700 — Fixed bare-LF hook context rendering in the daemon terminal model so lines like `Nodes`, `Edges`, and `Files` do not run together when the child emits newline-only separators.
+- 2026-05-15T08:27-0700 — Validation passed: `cargo fmt --all -- --check`, `/home/dberrios/.cargo/bin/cargo test -p argus-daemon -p argus-tui`, and `cargo clippy -p argus-daemon -p argus-tui --all-targets --all-features --locked -- -D warnings`.
+- 2026-05-15T08:32-0700 — Fixed scrollback-heavy TUI latency by capping render work to the visible pane and carrying a `styled_rows_start` anchor so snapshots style only the live viewport while preserving plain scrollback history.
+- 2026-05-15T08:32-0700 — Validation passed: `cargo fmt --all -- --check`, `/home/dberrios/.cargo/bin/cargo test -p argus-daemon -p argus-tui`, and `cargo clippy -p argus-core -p argus-daemon -p argus-tui --all-targets --all-features --locked -- -D warnings`.
+- 2026-05-15T08:46-0700 — Changed active terminal-pane selections so `Ctrl-C` copies through OSC 52 and consumes the key instead of sending interrupt input to the child session; without a selection, `Ctrl-C` still forwards normally.
+- 2026-05-15T08:48-0700 — Validation passed: `cargo fmt --all -- --check`, `/home/dberrios/.cargo/bin/cargo test -p argus-tui`, `/home/dberrios/.cargo/bin/cargo test -p argus-daemon`, `cargo clippy -p argus-core -p argus-daemon -p argus-tui --all-targets --all-features --locked -- -D warnings`, and `git diff --check`.
+- 2026-05-15T08:49-0700 — Fixed scrolled-back TUI views to keep the selected content anchored when later daemon snapshots append additional scrollback rows, while leaving bottom-following behavior unchanged.
+- 2026-05-15T08:50-0700 — Validation passed: `cargo fmt --all -- --check`, `/home/dberrios/.cargo/bin/cargo test -p argus-tui`, `/home/dberrios/.cargo/bin/cargo test -p argus-daemon`, `cargo clippy -p argus-core -p argus-daemon -p argus-tui --all-targets --all-features --locked -- -D warnings`, and `git diff --check`.
+- 2026-05-15T08:59-0700 — Enabled Crossterm bracketed paste handling so paste events are forwarded to the selected session as one byte buffer instead of a sequence of key events.
+- 2026-05-15T09:01-0700 — Restored full-range styled terminal snapshots after the live-viewport style optimization dropped colors from scrollback and other rows outside the narrowed style anchor.
+- 2026-05-15T09:01-0700 — Validation passed: `cargo fmt --all -- --check`, `/home/dberrios/.cargo/bin/cargo test -p argus-tui`, `/home/dberrios/.cargo/bin/cargo test -p argus-daemon`, `cargo clippy -p argus-core -p argus-daemon -p argus-tui --all-targets --all-features --locked -- -D warnings`, and `git diff --check`.
+- 2026-05-15T11:48-0700 — Addressed review findings by removing daemon-side bare-LF normalization before `wezterm_term` ingestion and forwarding TUI paste events with `ESC[200~`/`ESC[201~` delimiters.
+- 2026-05-15T11:58-0700 — Addressed review feedback by decoding percent-escaped OSC 7 cwd file URI paths before reusing them for daemon session cwd metadata.
+- 2026-05-15T11:59-0700 — Validation passed: `cargo fmt --all -- --check`, `/home/dberrios/.cargo/bin/cargo test -p argus-daemon`, `cargo clippy -p argus-daemon --all-targets --all-features --locked -- -D warnings`, and `git diff --check`.
+- 2026-05-15T12:10-0700 — Fixed live exited-session rendering by treating `SessionEvent::Exited` as a final snapshot refresh trigger, preserving styled terminal rows after the shell exits.
+- 2026-05-15T12:33-0700 — Kept mouse-down as a pending selection until the pointer moves, preventing plain terminal clicks from drawing a single-cell selection or dropping styled terminal colors.
+- 2026-05-15T12:36-0700 — Updated active selection rendering to split styled spans at selected character bounds and retain their existing foreground/background styles while marking selected segments.
+- 2026-05-15T13:05-0700 — Inspected unresolved PR #17 review threads and patched the hot typing/output path plus actionable TUI/daemon cleanup comments, including root-cause-only closed-socket suppression.
+- 2026-05-15T15:05-0700 — Profiled daemon terminal output ingestion and snapshot construction. Release-mode profiling for ~590 KiB of styled output showed ingest around 20 ms, plain row extraction around 1 ms, full styled row extraction around 18 ms, and 25 full styled snapshots around 230 ms; limiting styled snapshots to the live 32-row viewport reduced 25 snapshot iterations to about 13 ms.
+- 2026-05-15T15:05-0700 — Addressed the event fan-out review issue by keeping slow subscribers attached when their output buffer fills, then made the TUI draw only when state changes so typing and scrolling are not competing with idle redraws.
+- 2026-05-15T15:05-0700 — Validation passed: `cargo fmt --all -- --check`, `cargo check --workspace`, `/home/dberrios/.cargo/bin/cargo test --workspace`, and `cargo clippy --all-targets --all-features -- -D warnings`.
+- 2026-05-15T16:48-0700 — Addressed review feedback by exposing the daemon terminal's bracketed-paste mode in snapshots, forwarding raw paste text when the child has not requested bracketed paste, and escaping percent/space/hash characters before the TUI OSC 7 prompt hook emits cwd file URI paths.
+- 2026-05-15T16:48-0700 — Validation passed: `cargo fmt --all` and `/home/dberrios/.cargo/bin/cargo test -p argus-tui -p argus-daemon`.
+- 2026-05-15T22:10-0700 — Addressed review feedback by fanning terminal resize events out to every live TUI session instead of only the selected session, with regression coverage for an inactive session.
+- 2026-05-15T22:10-0700 — Validation passed: `cargo fmt --all`, `/home/dberrios/.cargo/bin/cargo test -p argus-tui terminal_resize_updates_inactive_sessions --locked`, `/home/dberrios/.cargo/bin/cargo test -p argus-tui --locked`, and `git diff --check`.
+- 2026-05-15T17:13-0700 — Added `SessionApi::styled_rows` end to end through core, daemon actor, Unix socket IPC, and the TUI so colored scrollback is loaded by visible row range instead of by full retained history snapshot.
+- 2026-05-15T17:13-0700 — Validation passed: `/home/dberrios/.cargo/bin/cargo test -p argus-tui -p argus-daemon`, `cargo check --workspace`, and `cargo clippy --all-targets --all-features -- -D warnings`.
+- 2026-05-15T17:17-0700 — Full workspace validation passed: `/home/dberrios/.cargo/bin/cargo test --workspace`, `cargo fmt --all -- --check`, and `git diff --check`.
+- 2026-05-15T20:43-0700 — Replaced best-effort session event fan-out with sequenced envelopes, a bounded replay buffer, per-subscriber replay cursors, and an explicit resync event for subscribers whose cursor falls outside retained history.
+- 2026-05-15T20:43-0700 — Fixed scrolled-back color refreshes while output advances by allowing newer styled-row responses for non-live-bottom history ranges.
+- 2026-05-15T20:43-0700 — Validation passed: `cargo fmt --all`, focused replay/scrollback color tests, and `/home/dberrios/.cargo/bin/cargo test -p argus-tui -p argus-daemon`.
+- 2026-05-15T21:33-0700 — Addressed review feedback by making the default TUI shell bootstrap POSIX-compatible under `/bin/sh`, replacing bash-only prompt path substitutions with a `sed`-based escape pipeline and adding `/bin/sh` syntax coverage.
+- 2026-05-15T21:33-0700 — Validation passed: `cargo fmt --all -- --check`, `/home/dberrios/.cargo/bin/cargo test -p argus-tui default_shell`, and `/home/dberrios/.cargo/bin/cargo test -p argus-tui`.
+- 2026-05-15T22:34-0700 — Addressed unresolved PR review feedback by sanitizing bracketed paste payload terminators, refreshing paste-time snapshot state, preserving selected trailing whitespace, requiring styled-row responses to match the cached output sequence, clearing overlong unterminated OSC 7 cwd buffers, and removing dead attach/render parameters.
+- 2026-05-15T22:34-0700 — Validation passed: `cargo fmt --all -- --check`, `cargo check -p argus-daemon -p argus-tui`, `cargo test -p argus-tui paste_input --locked`, `cargo test -p argus-tui terminal_selection --locked`, `cargo test -p argus-tui ensure_selected_styled_rows --locked`, `cargo test -p argus-daemon output_state_bounds_unterminated_osc7_working_directory --locked`, `cargo clippy -p argus-daemon -p argus-tui --all-targets --all-features --locked -- -D warnings`, and `cargo test -p argus-tui -p argus-daemon --locked`.
+- 2026-05-15T23:13-0700 — Added review-follow-up daemon regression tests for dead event subscriber pruning and recovery after aborting an overlong unterminated OSC 7 cwd sequence.
+- 2026-05-15T23:13-0700 — Validation passed: `cargo fmt --all -- --check`, `cargo test -p argus-daemon output_state_recovers_after_aborting_overlong_osc7_working_directory --locked`, `cargo test -p argus-daemon dropped_event_subscribers_are_pruned_on_next_flush --locked`, `/home/dberrios/.cargo/bin/cargo test -p argus-daemon --locked`, and `cargo clippy -p argus-daemon --all-targets --all-features --locked -- -D warnings`.
+- 2026-05-15T23:20-0700 — Fixed scrolled-back rows losing color by letting the TUI accept newer styled-row responses when their reconstructed text still matches the cached scrollback range.
+- 2026-05-15T23:20-0700 — Validation passed: `cargo fmt --all -- --check`, `cargo test -p argus-tui ensure_selected_styled_rows --locked`, `/home/dberrios/.cargo/bin/cargo test -p argus-tui --locked`, and `cargo clippy -p argus-tui --all-targets --all-features --locked -- -D warnings`.

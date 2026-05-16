@@ -11,8 +11,9 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use argus_core::session::{
     AttachSessionRequest, AttachSessionResponse, ClientId, CompletedSession, InputLeaseRequest,
-    LeaseChange, ResizeSessionRequest, SessionApi, SessionEvent, SessionEventReceiver, SessionId,
-    SessionSnapshot, StartSessionRequest, WriteInputRequest,
+    LeaseChange, ResizeSessionRequest, SessionApi, SessionEventEnvelope, SessionEventReceiver,
+    SessionId, SessionSnapshot, StartSessionRequest, StyledRowsRequest, StyledRowsResponse,
+    SubscribeSessionEventsRequest, WriteInputRequest,
 };
 use serde::{Deserialize, Serialize};
 
@@ -53,7 +54,9 @@ impl UnixSocketServer {
                     if let Err(error) = thread::Builder::new()
                         .name("argus-ipc-client".to_string())
                         .spawn(move || {
-                            if let Err(error) = handle_connection(manager, stream) {
+                            if let Err(error) = handle_connection(manager, stream)
+                                && !is_closed_socket_error(&error)
+                            {
                                 tracing::warn!(error = ?error, "Unix socket client failed");
                             }
                         })
@@ -106,6 +109,13 @@ pub fn default_socket_path() -> PathBuf {
 }
 
 impl SessionApi for UnixSocketClient {
+    fn list_sessions(&self) -> Result<Vec<SessionId>> {
+        match self.round_trip(WireRequest::ListSessions)? {
+            WireSuccess::SessionIds(session_ids) => Ok(session_ids),
+            other => bail!("unexpected list_sessions response: {other:?}"),
+        }
+    }
+
     fn start_session(&self, request: StartSessionRequest) -> Result<SessionId> {
         match self.round_trip(WireRequest::StartSession(request))? {
             WireSuccess::SessionId(session_id) => Ok(session_id),
@@ -121,11 +131,24 @@ impl SessionApi for UnixSocketClient {
     }
 
     fn subscribe_session_events(&self, session_id: SessionId) -> Result<SessionEventReceiver> {
+        self.subscribe_session_events_from(SubscribeSessionEventsRequest {
+            session_id,
+            after_event_seq: None,
+        })
+    }
+
+    fn subscribe_session_events_from(
+        &self,
+        request: SubscribeSessionEventsRequest,
+    ) -> Result<SessionEventReceiver> {
         let mut stream = UnixStream::connect(&self.socket_path)
             .with_context(|| format!("connecting to {}", self.socket_path.display()))?;
         write_json_line(
             &mut stream,
-            &WireRequest::SubscribeSessionEvents { session_id },
+            &WireRequest::SubscribeSessionEvents {
+                session_id: request.session_id,
+                after_event_seq: request.after_event_seq,
+            },
         )
         .context("writing Unix socket subscribe request")?;
         stream
@@ -152,8 +175,8 @@ impl SessionApi for UnixSocketClient {
                         break;
                     };
                     match response.into_result() {
-                        Ok(WireSuccess::SessionEvent(event)) => {
-                            if tx.send(event).is_err() {
+                        Ok(WireSuccess::SessionEvent(envelope)) => {
+                            if tx.send(envelope).is_err() {
                                 break;
                             }
                         }
@@ -209,6 +232,13 @@ impl SessionApi for UnixSocketClient {
         }
     }
 
+    fn styled_rows(&self, request: StyledRowsRequest) -> Result<StyledRowsResponse> {
+        match self.round_trip(WireRequest::StyledRows(request))? {
+            WireSuccess::StyledRows(response) => Ok(response),
+            other => bail!("unexpected styled_rows response: {other:?}"),
+        }
+    }
+
     fn shutdown_session(&self, session_id: SessionId) -> Result<CompletedSession> {
         match self.round_trip(WireRequest::ShutdownSession { session_id })? {
             WireSuccess::CompletedSession(completed) => Ok(completed),
@@ -219,10 +249,12 @@ impl SessionApi for UnixSocketClient {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum WireRequest {
+    ListSessions,
     StartSession(StartSessionRequest),
     AttachSession(AttachSessionRequest),
     SubscribeSessionEvents {
         session_id: SessionId,
+        after_event_seq: Option<u64>,
     },
     AcquireInputLease(InputLeaseRequest),
     ReleaseInputLease {
@@ -234,6 +266,7 @@ enum WireRequest {
     SnapshotSession {
         session_id: SessionId,
     },
+    StyledRows(StyledRowsRequest),
     ShutdownSession {
         session_id: SessionId,
     },
@@ -266,13 +299,15 @@ impl WireResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum WireSuccess {
     Unit,
+    SessionIds(Vec<SessionId>),
     SessionId(SessionId),
     AttachSession(AttachSessionResponse),
     LeaseChange(LeaseChange),
     SessionSnapshot(SessionSnapshot),
+    StyledRows(StyledRowsResponse),
     CompletedSession(CompletedSession),
     Subscribed,
-    SessionEvent(SessionEvent),
+    SessionEvent(SessionEventEnvelope),
     Heartbeat,
 }
 
@@ -348,8 +383,12 @@ fn handle_connection(manager: Arc<SessionManager>, stream: UnixStream) -> Result
     let request: WireRequest = read_json_line(&mut reader)?.context("reading request")?;
     let mut writer = BufWriter::new(stream);
 
-    if let WireRequest::SubscribeSessionEvents { session_id } = request {
-        return handle_subscription(&manager, session_id, &mut writer);
+    if let WireRequest::SubscribeSessionEvents {
+        session_id,
+        after_event_seq,
+    } = request
+    {
+        return handle_subscription(&manager, session_id, after_event_seq, &mut writer);
     }
 
     let response = WireResponse::from_result(handle_request(&manager, request));
@@ -361,9 +400,13 @@ fn handle_connection(manager: Arc<SessionManager>, stream: UnixStream) -> Result
 fn handle_subscription(
     manager: &SessionManager,
     session_id: SessionId,
+    after_event_seq: Option<u64>,
     writer: &mut BufWriter<UnixStream>,
 ) -> Result<()> {
-    match manager.subscribe_session_events(session_id) {
+    match manager.subscribe_session_events_from(SubscribeSessionEventsRequest {
+        session_id,
+        after_event_seq,
+    }) {
         Ok(events) => {
             write_json_line(writer, &WireResponse::Ok(WireSuccess::Subscribed))
                 .context("writing subscribe response")?;
@@ -404,6 +447,7 @@ fn handle_subscription(
 
 fn handle_request(manager: &SessionManager, request: WireRequest) -> Result<WireSuccess> {
     match request {
+        WireRequest::ListSessions => manager.list_sessions().map(WireSuccess::SessionIds),
         WireRequest::StartSession(request) => {
             manager.start_session(request).map(WireSuccess::SessionId)
         }
@@ -431,6 +475,9 @@ fn handle_request(manager: &SessionManager, request: WireRequest) -> Result<Wire
         WireRequest::SnapshotSession { session_id } => manager
             .snapshot_session(session_id)
             .map(WireSuccess::SessionSnapshot),
+        WireRequest::StyledRows(request) => {
+            manager.styled_rows(request).map(WireSuccess::StyledRows)
+        }
         WireRequest::ShutdownSession { session_id } => manager
             .shutdown_session(session_id)
             .map(WireSuccess::CompletedSession),
@@ -453,11 +500,23 @@ fn write_json_line<T: Serialize>(writer: &mut impl Write, value: &T) -> Result<(
     writer.write_all(b"\n").context("terminating JSON line")
 }
 
+fn is_closed_socket_error(error: &anyhow::Error) -> bool {
+    error
+        .root_cause()
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|io_error| {
+            matches!(
+                io_error.kind(),
+                ErrorKind::BrokenPipe | ErrorKind::ConnectionReset | ErrorKind::UnexpectedEof
+            )
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::session::SessionManagerConfig;
-    use argus_core::session::{AttachMode, SessionSize};
+    use argus_core::session::{AttachMode, SessionEvent, SessionSize};
     use std::time::{Duration, Instant};
 
     #[test]
@@ -485,6 +544,25 @@ mod tests {
     }
 
     #[test]
+    fn closed_socket_errors_are_expected_client_disconnects() {
+        let error = Err::<(), _>(std::io::Error::from(ErrorKind::BrokenPipe))
+            .context("flushing subscription response")
+            .expect_err("broken pipe should stay an error");
+
+        assert!(is_closed_socket_error(&error));
+    }
+
+    #[test]
+    fn closed_socket_detection_only_matches_root_cause() {
+        let error = anyhow!(
+            "flushing subscription response: {}",
+            std::io::Error::from(ErrorKind::BrokenPipe)
+        );
+
+        assert!(!is_closed_socket_error(&error));
+    }
+
+    #[test]
     #[cfg_attr(
         windows,
         ignore = "portable-pty ConPTY behavior needs a dedicated Windows lifecycle test"
@@ -507,6 +585,12 @@ mod tests {
         request.args = vec!["-lc".to_string(), "cat".to_string()];
         request.size = SessionSize::default();
         let session_id = client.start_session(request).expect("start session");
+        assert!(
+            client
+                .list_sessions()
+                .expect("list sessions")
+                .contains(&session_id)
+        );
         let events = client
             .subscribe_session_events(session_id.clone())
             .expect("subscribe events");
@@ -595,7 +679,7 @@ mod tests {
             let remaining = deadline.saturating_duration_since(Instant::now());
             assert!(!remaining.is_zero(), "timed out waiting for output event");
             match events.recv_timeout(remaining.min(Duration::from_millis(100))) {
-                Ok(SessionEvent::Output { .. }) => return,
+                Ok(envelope) if matches!(envelope.event, SessionEvent::Output { .. }) => return,
                 Ok(_) => {}
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => {

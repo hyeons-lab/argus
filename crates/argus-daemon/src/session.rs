@@ -1,7 +1,9 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
+#[cfg(unix)]
+use std::os::unix::ffi::OsStringExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -16,14 +18,17 @@ use anyhow::{Context, Result, anyhow, ensure};
 use argus_core::session::{
     AttachSessionRequest, AttachSessionResponse, ClientId, CompletedSession, InputLeaseRequest,
     InputLeaseState, LeaseChange, ResizeSessionRequest, SessionApi, SessionEvent,
-    SessionEventReceiver, SessionId, SessionSize, SessionSnapshot, StartSessionRequest,
-    WriteInputRequest,
+    SessionEventEnvelope, SessionEventReceiver, SessionId, SessionSize, SessionSnapshot,
+    StartSessionRequest, StyledRow, StyledRowsRequest, StyledRowsResponse, StyledSpan,
+    SubscribeSessionEventsRequest, TerminalColor, TerminalCursor, TerminalStyle, WriteInputRequest,
 };
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
-use wezterm_term::color::ColorPalette;
-use wezterm_term::{Terminal, TerminalConfiguration, TerminalSize};
+use wezterm_term::color::{ColorAttribute, ColorPalette, SrgbaTuple};
+use wezterm_term::{Intensity, Terminal, TerminalConfiguration, TerminalSize, Underline};
 
 const EVENT_SUBSCRIBER_BUFFER: usize = 64;
+const EVENT_REPLAY_BUFFER: usize = 1024;
+const MAX_OSC_BUFFER: usize = 4096;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionConfig {
@@ -67,7 +72,7 @@ pub struct PtySession {
     _master: Box<dyn MasterPty + Send>,
     child: Box<dyn Child + Send + Sync>,
     reader: Box<dyn Read + Send>,
-    _writer: Box<dyn Write + Send>,
+    _writer: SharedPtyWriter,
     output: OutputState,
 }
 
@@ -133,6 +138,11 @@ impl Default for SessionManager {
 }
 
 impl SessionApi for SessionManager {
+    fn list_sessions(&self) -> Result<Vec<SessionId>> {
+        let sessions = self.sessions()?;
+        Ok(sessions.keys().cloned().collect())
+    }
+
     fn start_session(&self, request: StartSessionRequest) -> Result<SessionId> {
         request.validate()?;
         fs::create_dir_all(&self.config.log_dir).with_context(|| {
@@ -182,11 +192,21 @@ impl SessionApi for SessionManager {
     }
 
     fn subscribe_session_events(&self, session_id: SessionId) -> Result<SessionEventReceiver> {
+        self.subscribe_session_events_from(SubscribeSessionEventsRequest {
+            session_id,
+            after_event_seq: None,
+        })
+    }
+
+    fn subscribe_session_events_from(
+        &self,
+        request: SubscribeSessionEventsRequest,
+    ) -> Result<SessionEventReceiver> {
         let sessions = self.sessions()?;
         let session = sessions
-            .get(&session_id)
-            .with_context(|| format!("session {session_id} not found"))?;
-        session.actor.subscribe_events()
+            .get(&request.session_id)
+            .with_context(|| format!("session {} not found", request.session_id))?;
+        session.actor.subscribe_events(request.after_event_seq)
     }
 
     fn acquire_input_lease(&self, request: InputLeaseRequest) -> Result<LeaseChange> {
@@ -256,6 +276,14 @@ impl SessionApi for SessionManager {
         session.actor.snapshot()
     }
 
+    fn styled_rows(&self, request: StyledRowsRequest) -> Result<StyledRowsResponse> {
+        let sessions = self.sessions()?;
+        let session = sessions
+            .get(&request.session_id)
+            .with_context(|| format!("session {} not found", request.session_id))?;
+        session.actor.styled_rows(request.start, request.end)
+    }
+
     fn shutdown_session(&self, session_id: SessionId) -> Result<CompletedSession> {
         let session = {
             let mut sessions = self.sessions()?;
@@ -286,7 +314,9 @@ impl PtySession {
         loop {
             match self.reader.read(&mut chunk) {
                 Ok(0) => break,
-                Ok(read_len) => self.output.ingest(&chunk[..read_len])?,
+                Ok(read_len) => {
+                    self.output.ingest(&chunk[..read_len])?;
+                }
                 Err(error) if error.kind() == ErrorKind::Interrupted => continue,
                 Err(error)
                     if matches!(
@@ -339,6 +369,7 @@ impl SessionActor {
         config: SessionConfig,
         event_session_id: Option<SessionId>,
     ) -> Result<Self> {
+        let initial_working_directory = config.cwd.clone().or_else(|| std::env::current_dir().ok());
         let runtime = spawn_pty_runtime(config)?;
         let PtyRuntime {
             master,
@@ -367,8 +398,11 @@ impl SessionActor {
                     exited: false,
                     output_closed: false,
                     exit_broadcasted: false,
+                    current_working_directory: initial_working_directory,
                     event_session_id,
                     subscribers: Vec::new(),
+                    event_log: VecDeque::new(),
+                    next_event_seq: 1,
                 };
                 run_actor(state, command_rx, output_rx);
             })
@@ -381,12 +415,24 @@ impl SessionActor {
         })
     }
 
-    pub fn subscribe_events(&self) -> Result<SessionEventReceiver> {
+    pub fn subscribe_events(&self, after_event_seq: Option<u64>) -> Result<SessionEventReceiver> {
         let (tx, rx) = mpsc::channel();
         self.tx
-            .send(ActorCommand::SubscribeEvents { response: tx })
+            .send(ActorCommand::SubscribeEvents {
+                after_event_seq,
+                response: tx,
+            })
             .context("sending session event subscription command")?;
         recv_actor_result(rx, "subscribing to session events")
+    }
+
+    #[cfg(test)]
+    fn subscriber_count(&self) -> Result<usize> {
+        let (tx, rx) = mpsc::channel();
+        self.tx
+            .send(ActorCommand::SubscriberCount { response: tx })
+            .context("sending session subscriber count command")?;
+        recv_actor_result(rx, "counting session event subscribers")
     }
 
     pub fn broadcast_event(&self, event: SessionEvent) -> Result<()> {
@@ -425,6 +471,18 @@ impl SessionActor {
             .send(ActorCommand::Snapshot { response: tx })
             .context("sending session snapshot command")?;
         recv_actor_result(rx, "reading session snapshot")
+    }
+
+    pub fn styled_rows(&self, start: usize, end: usize) -> Result<StyledRowsResponse> {
+        let (tx, rx) = mpsc::channel();
+        self.tx
+            .send(ActorCommand::StyledRows {
+                start,
+                end,
+                response: tx,
+            })
+            .context("sending session styled row command")?;
+        recv_actor_result(rx, "reading session styled rows")
     }
 
     pub fn shutdown(mut self) -> Result<CompletedSession> {
@@ -469,21 +527,29 @@ impl Drop for SessionActor {
 struct ActorState {
     master: Box<dyn MasterPty + Send>,
     child: Box<dyn Child + Send + Sync>,
-    writer: Box<dyn Write + Send>,
+    writer: SharedPtyWriter,
     output: OutputState,
     size: SessionSize,
     exited: bool,
     output_closed: bool,
     exit_broadcasted: bool,
+    current_working_directory: Option<PathBuf>,
     event_session_id: Option<SessionId>,
-    subscribers: Vec<SyncSender<SessionEvent>>,
+    subscribers: Vec<EventSubscriber>,
+    event_log: VecDeque<SessionEventEnvelope>,
+    next_event_seq: u64,
+}
+
+struct EventSubscriber {
+    tx: SyncSender<SessionEventEnvelope>,
+    next_event_seq: u64,
 }
 
 struct PtyRuntime {
     master: Box<dyn MasterPty + Send>,
     child: Box<dyn Child + Send + Sync>,
     reader: Box<dyn Read + Send>,
-    writer: Box<dyn Write + Send>,
+    writer: SharedPtyWriter,
     output: OutputState,
     size: SessionSize,
 }
@@ -491,6 +557,7 @@ struct PtyRuntime {
 struct OutputState {
     log: File,
     terminal: Terminal,
+    cwd_sequence_buffer: Vec<u8>,
     bytes_logged: u64,
     output_seq: u64,
 }
@@ -512,8 +579,18 @@ enum ActorCommand {
     Snapshot {
         response: Sender<ActorResult<SessionSnapshot>>,
     },
+    StyledRows {
+        start: usize,
+        end: usize,
+        response: Sender<ActorResult<StyledRowsResponse>>,
+    },
     SubscribeEvents {
+        after_event_seq: Option<u64>,
         response: Sender<ActorResult<SessionEventReceiver>>,
+    },
+    #[cfg(test)]
+    SubscriberCount {
+        response: Sender<ActorResult<usize>>,
     },
     BroadcastEvent {
         event: SessionEvent,
@@ -525,6 +602,7 @@ enum ActorCommand {
 }
 
 type ActorResult<T> = Result<T>;
+type SharedPtyWriter = Arc<Mutex<Box<dyn Write + Send>>>;
 
 fn run_actor(
     mut state: ActorState,
@@ -542,6 +620,7 @@ fn run_actor(
                 Err(RecvTimeoutError::Timeout) => {
                     state.reap_child();
                     state.broadcast_exit();
+                    state.flush_subscribers();
                 }
                 Err(RecvTimeoutError::Disconnected) => break,
             }
@@ -561,11 +640,12 @@ fn run_actor(
 
         match output_rx.recv_timeout(Duration::from_millis(20)) {
             Ok(message) => state.handle_output(message),
-            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Timeout) => state.flush_subscribers(),
             Err(RecvTimeoutError::Disconnected) => {
                 state.output_closed = true;
                 state.mark_exited();
                 state.broadcast_exit();
+                state.flush_subscribers();
             }
         }
     }
@@ -574,17 +654,21 @@ fn run_actor(
 impl ActorState {
     fn handle_output(&mut self, message: ActorMessage) {
         match message {
-            ActorMessage::Output(bytes) => {
-                if let Err(error) = self.output.ingest(&bytes) {
-                    tracing::warn!(error = ?error, "failed to ingest PTY output");
-                } else if let Some(session_id) = self.event_session_id.clone() {
-                    self.broadcast(SessionEvent::Output {
-                        session_id,
-                        output_seq: self.output.output_seq,
-                        bytes,
-                    });
+            ActorMessage::Output(bytes) => match self.output.ingest(&bytes) {
+                Ok(current_working_directory) => {
+                    if let Some(current_working_directory) = current_working_directory {
+                        self.current_working_directory = Some(current_working_directory);
+                    }
+                    if let Some(session_id) = self.event_session_id.clone() {
+                        self.broadcast(SessionEvent::Output {
+                            session_id,
+                            output_seq: self.output.output_seq,
+                            bytes,
+                        });
+                    }
                 }
-            }
+                Err(error) => tracing::warn!(error = ?error, "failed to ingest PTY output"),
+            },
             ActorMessage::OutputClosed(result) => {
                 if let Err(error) = result {
                     tracing::warn!(error = ?error, "PTY output reader closed with error");
@@ -615,8 +699,25 @@ impl ActorState {
                 let _ = response.send(Ok(self.snapshot()));
                 false
             }
-            ActorCommand::SubscribeEvents { response } => {
-                let _ = response.send(self.subscribe_events());
+            ActorCommand::StyledRows {
+                start,
+                end,
+                response,
+            } => {
+                let _ = response.send(self.styled_rows(start, end));
+                false
+            }
+            ActorCommand::SubscribeEvents {
+                after_event_seq,
+                response,
+            } => {
+                let _ = response.send(self.subscribe_events(after_event_seq));
+                false
+            }
+            #[cfg(test)]
+            ActorCommand::SubscriberCount { response } => {
+                self.flush_subscribers();
+                let _ = response.send(Ok(self.subscribers.len()));
                 false
             }
             ActorCommand::BroadcastEvent { event, response } => {
@@ -633,10 +734,12 @@ impl ActorState {
 
     fn write_input(&mut self, bytes: &[u8]) -> Result<()> {
         ensure!(!self.exited, "session has already exited");
-        self.writer
-            .write_all(bytes)
-            .context("writing input to PTY")?;
-        self.writer.flush().context("flushing PTY input")?;
+        let mut writer = self
+            .writer
+            .lock()
+            .map_err(|_| anyhow!("PTY writer lock poisoned"))?;
+        writer.write_all(bytes).context("writing input to PTY")?;
+        writer.flush().context("flushing PTY input")?;
         Ok(())
     }
 
@@ -658,13 +761,38 @@ impl ActorState {
     }
 
     fn snapshot(&self) -> SessionSnapshot {
+        let visible_rows = visible_rows(&self.output.terminal);
+        let styled_rows_start = visible_rows.len().saturating_sub(self.size.rows);
         SessionSnapshot {
             output_seq: self.output.output_seq,
             bytes_logged: self.output.bytes_logged,
             size: self.size.clone(),
-            visible_rows: visible_rows(&self.output.terminal),
+            styled_rows: styled_visible_rows_for_range(
+                &self.output.terminal,
+                styled_rows_start,
+                visible_rows.len(),
+            ),
+            styled_rows_start,
+            visible_rows,
+            cursor: terminal_cursor(&self.output.terminal),
+            current_working_directory: self.current_working_directory.clone(),
+            bracketed_paste_enabled: self.output.terminal.bracketed_paste_enabled(),
             exited: self.exited,
         }
+    }
+
+    fn styled_rows(&self, start: usize, end: usize) -> Result<StyledRowsResponse> {
+        ensure!(start <= end, "styled row start must be before end");
+        let row_count = self.output.terminal.screen().scrollback_rows();
+        ensure!(
+            end <= row_count,
+            "styled row range {start}..{end} exceeds retained row count {row_count}"
+        );
+        Ok(StyledRowsResponse {
+            output_seq: self.output.output_seq,
+            start,
+            rows: styled_visible_rows_for_range(&self.output.terminal, start, end),
+        })
     }
 
     fn shutdown(
@@ -689,22 +817,100 @@ impl ActorState {
         Ok(completed)
     }
 
-    fn subscribe_events(&mut self) -> Result<SessionEventReceiver> {
+    fn subscribe_events(&mut self, after_event_seq: Option<u64>) -> Result<SessionEventReceiver> {
         ensure!(
             self.event_session_id.is_some(),
             "session actor was not configured for event fan-out"
         );
         let (tx, rx) = mpsc::sync_channel(EVENT_SUBSCRIBER_BUFFER);
-        self.subscribers.push(tx);
+        let next_event_seq = after_event_seq
+            .map(|event_seq| event_seq.saturating_add(1))
+            .unwrap_or(self.next_event_seq);
+        self.subscribers
+            .push(EventSubscriber { tx, next_event_seq });
+        self.flush_subscribers();
         Ok(rx)
     }
 
     fn broadcast(&mut self, event: SessionEvent) {
-        self.subscribers
-            .retain(|subscriber| match subscriber.try_send(event.clone()) {
-                Ok(()) => true,
-                Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => false,
-            });
+        self.record_event(event);
+        self.flush_subscribers();
+    }
+
+    fn record_event(&mut self, event: SessionEvent) {
+        let envelope = SessionEventEnvelope {
+            event_seq: self.next_event_seq,
+            event,
+        };
+        self.next_event_seq += 1;
+        self.event_log.push_back(envelope);
+        while self.event_log.len() > EVENT_REPLAY_BUFFER {
+            self.event_log.pop_front();
+        }
+    }
+
+    fn flush_subscribers(&mut self) {
+        let mut retained = Vec::with_capacity(self.subscribers.len());
+        let mut subscribers = std::mem::take(&mut self.subscribers);
+
+        for mut subscriber in subscribers.drain(..) {
+            if self.flush_subscriber(&mut subscriber) {
+                retained.push(subscriber);
+            }
+        }
+
+        self.subscribers = retained;
+    }
+
+    fn flush_subscriber(&self, subscriber: &mut EventSubscriber) -> bool {
+        loop {
+            if subscriber.next_event_seq >= self.next_event_seq {
+                return true;
+            }
+
+            let Some(oldest_event_seq) = self.event_log.front().map(|event| event.event_seq) else {
+                return true;
+            };
+
+            if subscriber.next_event_seq < oldest_event_seq {
+                let resync = self.resync_envelope();
+                return match subscriber.tx.try_send(resync) {
+                    Ok(()) => {
+                        subscriber.next_event_seq = self.next_event_seq;
+                        true
+                    }
+                    Err(TrySendError::Full(_)) => true,
+                    Err(TrySendError::Disconnected(_)) => false,
+                };
+            }
+
+            let event_index = (subscriber.next_event_seq - oldest_event_seq) as usize;
+            let Some(envelope) = self.event_log.get(event_index).cloned() else {
+                return true;
+            };
+
+            match subscriber.tx.try_send(envelope) {
+                Ok(()) => subscriber.next_event_seq += 1,
+                Err(TrySendError::Full(_)) => return true,
+                Err(TrySendError::Disconnected(_)) => return false,
+            }
+        }
+    }
+
+    fn resync_envelope(&self) -> SessionEventEnvelope {
+        let latest_event_seq = self.next_event_seq.saturating_sub(1);
+        let session_id = self
+            .event_session_id
+            .clone()
+            .expect("event fan-out requires session id");
+        SessionEventEnvelope {
+            event_seq: latest_event_seq,
+            event: SessionEvent::ResyncRequired {
+                session_id,
+                latest_event_seq,
+                snapshot: self.snapshot(),
+            },
+        }
     }
 
     fn broadcast_exit(&mut self) {
@@ -808,14 +1014,58 @@ impl ActorState {
 }
 
 impl OutputState {
-    fn ingest(&mut self, bytes: &[u8]) -> Result<()> {
+    fn ingest(&mut self, bytes: &[u8]) -> Result<Option<PathBuf>> {
         self.log
             .write_all(bytes)
             .context("writing PTY output log")?;
         self.bytes_logged += bytes.len() as u64;
         self.output_seq += 1;
+        let current_working_directory = self.extract_current_working_directory(bytes);
         self.terminal.advance_bytes(bytes);
-        Ok(())
+        Ok(current_working_directory)
+    }
+
+    fn extract_current_working_directory(&mut self, bytes: &[u8]) -> Option<PathBuf> {
+        if self.cwd_sequence_buffer.is_empty() {
+            let start = bytes.iter().position(|byte| *byte == 0x1b)?;
+            self.cwd_sequence_buffer.extend_from_slice(&bytes[start..]);
+        } else {
+            self.cwd_sequence_buffer.extend_from_slice(bytes);
+        }
+        let mut current_working_directory = None;
+
+        while let Some(start) = find_bytes(&self.cwd_sequence_buffer, b"\x1b]7;file://") {
+            if start > 0 {
+                self.cwd_sequence_buffer.drain(..start);
+            }
+
+            let Some(terminator) = find_osc_terminator(&self.cwd_sequence_buffer) else {
+                break;
+            };
+            let payload = &self.cwd_sequence_buffer[b"\x1b]7;file://".len()..terminator];
+            if let Some(path) = cwd_from_osc7_payload(payload) {
+                current_working_directory = Some(path);
+            }
+
+            let drain_to = if self.cwd_sequence_buffer[terminator] == 0x07 {
+                terminator + 1
+            } else {
+                terminator + 2
+            };
+            self.cwd_sequence_buffer.drain(..drain_to);
+        }
+
+        if !self.cwd_sequence_buffer.is_empty()
+            && find_bytes(&self.cwd_sequence_buffer, b"\x1b]7;file://").is_none()
+        {
+            retain_osc_prefix_candidate(&mut self.cwd_sequence_buffer);
+        }
+
+        if self.cwd_sequence_buffer.len() > MAX_OSC_BUFFER {
+            self.cwd_sequence_buffer.clear();
+        }
+
+        current_working_directory
     }
 }
 
@@ -845,7 +1095,7 @@ fn spawn_pty_runtime(config: SessionConfig) -> Result<PtyRuntime> {
         .master
         .try_clone_reader()
         .context("cloning PTY reader")?;
-    let writer = pair.master.take_writer().context("taking PTY writer")?;
+    let writer = shared_pty_writer(pair.master.take_writer().context("taking PTY writer")?);
     let log = OpenOptions::new()
         .create(true)
         .write(true)
@@ -857,7 +1107,9 @@ fn spawn_pty_runtime(config: SessionConfig) -> Result<PtyRuntime> {
         Arc::new(ArgusTerminalConfig),
         "Argus",
         env!("CARGO_PKG_VERSION"),
-        Box::new(TerminalInputSink),
+        Box::new(TerminalOutputSink {
+            writer: writer.clone(),
+        }),
     );
 
     Ok(PtyRuntime {
@@ -868,6 +1120,7 @@ fn spawn_pty_runtime(config: SessionConfig) -> Result<PtyRuntime> {
         output: OutputState {
             log,
             terminal,
+            cwd_sequence_buffer: Vec::new(),
             bytes_logged: 0,
             output_seq: 0,
         },
@@ -949,7 +1202,14 @@ fn reject_command_during_shutdown(command: ActorCommand) {
         ActorCommand::Snapshot { response } => {
             let _ = response.send(Err(error));
         }
-        ActorCommand::SubscribeEvents { response } => {
+        ActorCommand::StyledRows { response, .. } => {
+            let _ = response.send(Err(error));
+        }
+        ActorCommand::SubscribeEvents { response, .. } => {
+            let _ = response.send(Err(error));
+        }
+        #[cfg(test)]
+        ActorCommand::SubscriberCount { response } => {
             let _ = response.send(Err(error));
         }
         ActorCommand::BroadcastEvent { response, .. } => {
@@ -977,15 +1237,27 @@ fn join_thread_with_timeout(handle: JoinHandle<()>, name: &'static str) {
     }
 }
 
-struct TerminalInputSink;
+fn shared_pty_writer(writer: Box<dyn Write + Send>) -> SharedPtyWriter {
+    Arc::new(Mutex::new(writer))
+}
 
-impl Write for TerminalInputSink {
+struct TerminalOutputSink {
+    writer: SharedPtyWriter,
+}
+
+impl Write for TerminalOutputSink {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        Ok(buf.len())
+        self.writer
+            .lock()
+            .map_err(|_| std::io::Error::other("PTY writer lock poisoned"))?
+            .write(buf)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
+        self.writer
+            .lock()
+            .map_err(|_| std::io::Error::other("PTY writer lock poisoned"))?
+            .flush()
     }
 }
 
@@ -1003,19 +1275,625 @@ fn is_closed_pty_error(_: &std::io::Error) -> bool {
 fn visible_rows(terminal: &Terminal) -> Vec<String> {
     let screen = terminal.screen();
     let end = screen.scrollback_rows();
-    let start = end.saturating_sub(screen.physical_rows);
 
     screen
-        .lines_in_phys_range(start..end)
+        .lines_in_phys_range(0..end)
         .iter()
         .map(|line| line.as_str().trim_end().to_owned())
         .collect()
 }
 
 #[cfg(test)]
+fn styled_visible_rows(terminal: &Terminal) -> Vec<StyledRow> {
+    let screen = terminal.screen();
+    let end = screen.scrollback_rows();
+    styled_visible_rows_for_range(terminal, 0, end)
+}
+
+fn styled_visible_rows_for_range(terminal: &Terminal, start: usize, end: usize) -> Vec<StyledRow> {
+    let screen = terminal.screen();
+    let palette = ColorPalette::default();
+    let mut lines = screen.lines_in_phys_range(start..end);
+
+    lines
+        .iter_mut()
+        .map(|line| {
+            let mut spans: Vec<StyledSpan> = Vec::new();
+            let mut skip_cells = 0;
+            for cell in line.cells_mut() {
+                if skip_cells > 0 {
+                    skip_cells -= 1;
+                    continue;
+                }
+                let width = cell.width().max(1);
+                skip_cells = width.saturating_sub(1);
+                let style = terminal_style(cell.attrs(), &palette);
+                if let Some(span) = spans.last_mut()
+                    && span.style == style
+                {
+                    span.text.push_str(cell.str());
+                    continue;
+                }
+                spans.push(StyledSpan {
+                    text: cell.str().to_string(),
+                    style,
+                });
+            }
+            StyledRow { spans }
+        })
+        .collect()
+}
+
+fn terminal_cursor(terminal: &Terminal) -> TerminalCursor {
+    let screen = terminal.screen();
+    let cursor = terminal.cursor_pos();
+    TerminalCursor {
+        row: screen
+            .scrollback_rows()
+            .saturating_sub(screen.physical_rows)
+            + cursor.y.max(0) as usize,
+        col: cursor.x,
+        visible: matches!(
+            cursor.visibility,
+            wezterm_surface::CursorVisibility::Visible
+        ),
+    }
+}
+
+fn terminal_style(attrs: &wezterm_term::CellAttributes, palette: &ColorPalette) -> TerminalStyle {
+    TerminalStyle {
+        foreground: terminal_color(attrs.foreground(), palette, true),
+        background: terminal_color(attrs.background(), palette, false),
+        bold: attrs.intensity() == Intensity::Bold,
+        dim: attrs.intensity() == Intensity::Half,
+        italic: attrs.italic(),
+        underline: attrs.underline() != Underline::None,
+        reverse: attrs.reverse(),
+    }
+}
+
+fn terminal_color(
+    color: ColorAttribute,
+    palette: &ColorPalette,
+    foreground: bool,
+) -> Option<TerminalColor> {
+    if color == ColorAttribute::Default {
+        return None;
+    }
+    let SrgbaTuple(red, green, blue, _) = if foreground {
+        palette.resolve_fg(color)
+    } else {
+        palette.resolve_bg(color)
+    };
+    Some(TerminalColor {
+        red: srgb_component(red),
+        green: srgb_component(green),
+        blue: srgb_component(blue),
+    })
+}
+
+fn srgb_component(value: f32) -> u8 {
+    (value.clamp(0.0, 1.0) * 255.0).round() as u8
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+fn find_osc_terminator(bytes: &[u8]) -> Option<usize> {
+    let mut index = b"\x1b]7;file://".len();
+    while index < bytes.len() {
+        if bytes[index] == 0x07 {
+            return Some(index);
+        }
+        if bytes[index] == 0x1b && bytes.get(index + 1) == Some(&b'\\') {
+            return Some(index);
+        }
+        index += 1;
+    }
+    None
+}
+
+fn retain_osc_prefix_candidate(buffer: &mut Vec<u8>) {
+    let prefix = b"\x1b]7;file://";
+    let keep = (1..prefix.len())
+        .rev()
+        .find(|len| buffer.ends_with(&prefix[..*len]))
+        .unwrap_or(0);
+    if keep == 0 {
+        buffer.clear();
+    } else if buffer.len() > keep {
+        buffer.drain(..buffer.len() - keep);
+    }
+}
+
+fn cwd_from_osc7_payload(payload: &[u8]) -> Option<PathBuf> {
+    let slash = payload.iter().position(|byte| *byte == b'/')?;
+    let path_bytes = percent_decode_uri_path(&payload[slash..])?;
+    path_buf_from_uri_path_bytes(path_bytes)
+}
+
+#[cfg(unix)]
+fn path_buf_from_uri_path_bytes(path_bytes: Vec<u8>) -> Option<PathBuf> {
+    Some(std::ffi::OsString::from_vec(path_bytes).into())
+}
+
+#[cfg(not(unix))]
+fn path_buf_from_uri_path_bytes(path_bytes: Vec<u8>) -> Option<PathBuf> {
+    String::from_utf8(path_bytes).ok().map(PathBuf::from)
+}
+
+fn percent_decode_uri_path(path: &[u8]) -> Option<Vec<u8>> {
+    let mut decoded = Vec::with_capacity(path.len());
+    let mut index = 0;
+    while index < path.len() {
+        if path[index] == b'%' {
+            let high = hex_value(*path.get(index + 1)?)?;
+            let low = hex_value(*path.get(index + 2)?)?;
+            decoded.push((high << 4) | low);
+            index += 3;
+        } else {
+            decoded.push(path[index]);
+            index += 1;
+        }
+    }
+    Some(decoded)
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn output_state_extracts_osc7_working_directory() {
+        let log_path = unique_log_path();
+        let mut output = test_output_state(&log_path, SessionSize::default());
+
+        assert!(
+            output
+                .ingest(b"\x1b]7;file://host/tmp/arg")
+                .unwrap()
+                .is_none()
+        );
+        let cwd = output.ingest(b"us\x1b\\").unwrap();
+
+        assert_eq!(cwd, Some(PathBuf::from("/tmp/argus")));
+        let _ = std::fs::remove_file(log_path);
+    }
+
+    #[test]
+    fn output_state_tracks_bracketed_paste_mode() {
+        let log_path = unique_log_path();
+        let mut output = test_output_state(&log_path, SessionSize::default());
+
+        assert!(!output.terminal.bracketed_paste_enabled());
+        output
+            .ingest(b"\x1b[?2004h")
+            .expect("enable bracketed paste");
+        assert!(output.terminal.bracketed_paste_enabled());
+        output
+            .ingest(b"\x1b[?2004l")
+            .expect("disable bracketed paste");
+        assert!(!output.terminal.bracketed_paste_enabled());
+        let _ = std::fs::remove_file(log_path);
+    }
+
+    #[test]
+    fn output_state_skips_cwd_scan_when_chunk_has_no_escape() {
+        let log_path = unique_log_path();
+        let mut output = test_output_state(&log_path, SessionSize::default());
+
+        let cwd = output
+            .ingest(b"plain output without control bytes")
+            .unwrap();
+
+        assert_eq!(cwd, None);
+        assert!(output.cwd_sequence_buffer.is_empty());
+        let _ = std::fs::remove_file(log_path);
+    }
+
+    #[test]
+    fn output_state_preserves_split_osc7_prefix_candidate() {
+        let log_path = unique_log_path();
+        let mut output = test_output_state(&log_path, SessionSize::default());
+
+        assert!(output.ingest(b"noise\x1b]7;file").unwrap().is_none());
+        let cwd = output.ingest(b"://host/tmp/split\x07").unwrap();
+
+        assert_eq!(cwd, Some(PathBuf::from("/tmp/split")));
+        let _ = std::fs::remove_file(log_path);
+    }
+
+    #[test]
+    fn output_state_decodes_osc7_percent_encoded_working_directory() {
+        let log_path = unique_log_path();
+        let mut output = test_output_state(&log_path, SessionSize::default());
+
+        let cwd = output
+            .ingest(b"\x1b]7;file://host/tmp/a%20b/%23hash%25\x07")
+            .unwrap();
+
+        assert_eq!(cwd, Some(PathBuf::from("/tmp/a b/#hash%")));
+        let _ = std::fs::remove_file(log_path);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn output_state_preserves_non_utf8_percent_encoded_working_directory() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let log_path = unique_log_path();
+        let mut output = test_output_state(&log_path, SessionSize::default());
+
+        let cwd = output.ingest(b"\x1b]7;file://host/tmp/%FF\x07").unwrap();
+
+        assert_eq!(
+            cwd.as_ref().expect("cwd").as_os_str().as_bytes(),
+            b"/tmp/\xFF"
+        );
+        let _ = std::fs::remove_file(log_path);
+    }
+
+    #[test]
+    fn output_state_ignores_malformed_osc7_percent_encoding() {
+        let log_path = unique_log_path();
+        let mut output = test_output_state(&log_path, SessionSize::default());
+
+        let cwd = output.ingest(b"\x1b]7;file://host/tmp/a%2x\x07").unwrap();
+
+        assert_eq!(cwd, None);
+        let _ = std::fs::remove_file(log_path);
+    }
+
+    #[test]
+    fn output_state_bounds_unterminated_osc7_working_directory() {
+        let log_path = unique_log_path();
+        let mut output = test_output_state(&log_path, SessionSize::default());
+
+        output
+            .ingest(b"\x1b]7;file://host/")
+            .expect("ingest partial OSC 7");
+        output
+            .ingest(&vec![b'a'; MAX_OSC_BUFFER * 2])
+            .expect("ingest unterminated OSC 7 payload");
+
+        assert!(output.cwd_sequence_buffer.is_empty());
+        let _ = std::fs::remove_file(log_path);
+    }
+
+    #[test]
+    fn output_state_recovers_after_aborting_overlong_osc7_working_directory() {
+        let log_path = unique_log_path();
+        let mut output = test_output_state(&log_path, SessionSize::default());
+
+        output
+            .ingest(b"\x1b]7;file://host/")
+            .expect("ingest partial OSC 7");
+        output
+            .ingest(&vec![b'a'; MAX_OSC_BUFFER * 2])
+            .expect("ingest overlong unterminated OSC 7 payload");
+
+        let cwd = output
+            .ingest(b"\x1b]7;file://host/tmp/recovered\x07")
+            .expect("ingest next OSC 7");
+
+        assert_eq!(cwd, Some(PathBuf::from("/tmp/recovered")));
+        let _ = std::fs::remove_file(log_path);
+    }
+
+    #[test]
+    fn styled_rows_preserve_foreground_color() {
+        let log_path = unique_log_path();
+        let mut output = test_output_state(&log_path, SessionSize::default());
+
+        output
+            .ingest(b"\x1b[31mred\x1b[0m plain")
+            .expect("ingest styled output");
+        let rows = styled_visible_rows(&output.terminal);
+        let red_span = rows
+            .iter()
+            .flat_map(|row| &row.spans)
+            .find(|span| span.text.contains("red"))
+            .expect("red span");
+
+        assert!(red_span.style.foreground.is_some());
+        let _ = std::fs::remove_file(log_path);
+    }
+
+    #[test]
+    fn styled_rows_preserve_dim_intensity() {
+        let log_path = unique_log_path();
+        let mut output = test_output_state(&log_path, SessionSize::default());
+
+        output
+            .ingest(b"\x1b[2mhint\x1b[0m")
+            .expect("ingest dim output");
+        let rows = styled_visible_rows(&output.terminal);
+        let dim_span = rows
+            .iter()
+            .flat_map(|row| &row.spans)
+            .find(|span| span.text.contains("hint"))
+            .expect("dim span");
+
+        assert!(dim_span.style.dim);
+        let _ = std::fs::remove_file(log_path);
+    }
+
+    #[test]
+    fn visible_rows_include_retained_scrollback() {
+        let log_path = unique_log_path();
+        let mut output = test_output_state(
+            &log_path,
+            SessionSize {
+                rows: 3,
+                cols: 24,
+                pixel_width: 240,
+                pixel_height: 60,
+                dpi: 96,
+            },
+        );
+
+        output
+            .ingest(b"line-1\r\nline-2\r\nline-3\r\nline-4\r\nline-5")
+            .expect("ingest scrollback output");
+        let rows = visible_rows(&output.terminal);
+
+        assert!(
+            rows.iter().any(|row| row.contains("line-1")),
+            "scrollback rows should include line-1: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|row| row.contains("line-5")),
+            "scrollback rows should include line-5: {rows:?}"
+        );
+        assert!(rows.len() > output.terminal.screen().physical_rows);
+        let _ = std::fs::remove_file(log_path);
+    }
+
+    #[test]
+    fn styled_rows_can_be_limited_to_current_viewport() {
+        let log_path = unique_log_path();
+        let mut output = test_output_state(
+            &log_path,
+            SessionSize {
+                rows: 3,
+                cols: 24,
+                pixel_width: 240,
+                pixel_height: 60,
+                dpi: 96,
+            },
+        );
+
+        output
+            .ingest(b"\x1b[31mline-1\r\nline-2\r\nline-3\r\nline-4\r\nline-5\x1b[0m")
+            .expect("ingest scrollback output");
+        let row_count = output.terminal.screen().scrollback_rows();
+        let styled_start = row_count.saturating_sub(output.terminal.screen().physical_rows);
+        let rows = styled_visible_rows_for_range(&output.terminal, styled_start, row_count);
+
+        assert_eq!(rows.len(), output.terminal.screen().physical_rows);
+        assert!(
+            rows.iter()
+                .flat_map(|row| &row.spans)
+                .any(|span| span.text.contains("line-5"))
+        );
+        assert!(
+            rows.iter()
+                .flat_map(|row| &row.spans)
+                .all(|span| !span.text.contains("line-1"))
+        );
+        let _ = std::fs::remove_file(log_path);
+    }
+
+    #[test]
+    fn styled_rows_response_extracts_requested_history_range() {
+        let log_path = unique_log_path();
+        let mut config = command_that_prints_marker(log_path.clone());
+        config.size = SessionSize {
+            rows: 2,
+            cols: 24,
+            pixel_width: 240,
+            pixel_height: 40,
+            dpi: 96,
+        };
+        let actor = SessionActor::spawn(config).expect("spawn session actor");
+        let snapshot = wait_for_visible_marker(&actor, "argus-ready");
+        let end = snapshot.visible_rows.len().min(2);
+        let response = actor.styled_rows(0, end).expect("load styled rows");
+
+        assert_eq!(response.output_seq, snapshot.output_seq);
+        assert_eq!(response.start, 0);
+        assert_eq!(response.rows.len(), end);
+        actor.shutdown().expect("shutdown session actor");
+        let _ = std::fs::remove_file(log_path);
+    }
+
+    #[test]
+    fn session_snapshot_styles_only_current_viewport() {
+        let log_path = unique_log_path();
+        let actor = SessionActor::spawn(command_that_prints_marker(log_path.clone()))
+            .expect("spawn session actor");
+        let snapshot = wait_for_visible_marker(&actor, "argus-ready");
+
+        assert!(snapshot.styled_rows.len() <= snapshot.size.rows);
+        assert_eq!(
+            snapshot.styled_rows_start,
+            snapshot
+                .visible_rows
+                .len()
+                .saturating_sub(snapshot.size.rows)
+        );
+        actor.shutdown().expect("shutdown session actor");
+        let _ = std::fs::remove_file(log_path);
+    }
+
+    #[test]
+    fn visible_rows_preserve_raw_bare_line_feed_columns() {
+        let log_path = unique_log_path();
+        let mut output = test_output_state(
+            &log_path,
+            SessionSize {
+                rows: 4,
+                cols: 32,
+                pixel_width: 320,
+                pixel_height: 80,
+                dpi: 96,
+            },
+        );
+
+        output
+            .ingest(b"Nodes: 330\nEdges: 2400\nFiles: 8")
+            .expect("ingest bare line feeds");
+        let rows = visible_rows(&output.terminal);
+
+        assert!(rows.iter().any(|row| row == "Nodes: 330"));
+        assert!(rows.iter().any(|row| row == "          Edges: 2400"));
+        assert!(
+            rows.iter()
+                .any(|row| row == "                     Files: 8")
+        );
+        let _ = std::fs::remove_file(log_path);
+    }
+
+    #[test]
+    fn terminal_cursor_uses_scrollback_row_coordinates() {
+        let log_path = unique_log_path();
+        let mut output = test_output_state(
+            &log_path,
+            SessionSize {
+                rows: 3,
+                cols: 24,
+                pixel_width: 240,
+                pixel_height: 60,
+                dpi: 96,
+            },
+        );
+
+        output
+            .ingest(b"line-1\r\nline-2\r\nline-3\r\nline-4\r\nline-5")
+            .expect("ingest scrollback output");
+        let cursor = terminal_cursor(&output.terminal);
+
+        assert!(
+            cursor.row
+                >= output
+                    .terminal
+                    .screen()
+                    .scrollback_rows()
+                    .saturating_sub(output.terminal.screen().physical_rows),
+            "cursor should be positioned within the scrollback-backed row list: {cursor:?}"
+        );
+        let _ = std::fs::remove_file(log_path);
+    }
+
+    #[test]
+    fn styled_rows_preserve_trailing_background_cells() {
+        let log_path = unique_log_path();
+        let mut output = test_output_state(
+            &log_path,
+            SessionSize {
+                rows: 2,
+                cols: 12,
+                pixel_width: 120,
+                pixel_height: 40,
+                dpi: 96,
+            },
+        );
+
+        output
+            .ingest(b"\x1b[44mbox    \x1b[0m")
+            .expect("ingest background output");
+        let rows = styled_visible_rows(&output.terminal);
+        let background_span = rows
+            .iter()
+            .flat_map(|row| &row.spans)
+            .find(|span| span.text.contains("box"))
+            .expect("background span");
+
+        assert_eq!(background_span.text, "box    ");
+        assert!(background_span.style.background.is_some());
+        let _ = std::fs::remove_file(log_path);
+    }
+
+    #[test]
+    fn styled_rows_preserve_clear_to_end_background_cells() {
+        let log_path = unique_log_path();
+        let mut output = test_output_state(
+            &log_path,
+            SessionSize {
+                rows: 2,
+                cols: 12,
+                pixel_width: 120,
+                pixel_height: 40,
+                dpi: 96,
+            },
+        );
+
+        output
+            .ingest(b"\x1b[48;2;32;32;32m\x1b[K")
+            .expect("ingest background clear output");
+        let rows = styled_visible_rows(&output.terminal);
+        let background_span = rows
+            .iter()
+            .flat_map(|row| &row.spans)
+            .find(|span| span.text == "            ")
+            .expect("clear-to-end background span");
+
+        assert_eq!(
+            background_span.style.background,
+            Some(TerminalColor {
+                red: 32,
+                green: 32,
+                blue: 32
+            })
+        );
+        let _ = std::fs::remove_file(log_path);
+    }
+
+    #[test]
+    fn terminal_color_queries_are_written_back_to_pty() {
+        let log_path = unique_log_path();
+        let responses = Arc::new(Mutex::new(Vec::new()));
+        let mut output = test_output_state_with_writer(
+            &log_path,
+            SessionSize::default(),
+            Box::new(RecordingWriter {
+                bytes: responses.clone(),
+            }),
+        );
+
+        output
+            .ingest(b"\x1b]11;?\x07")
+            .expect("ingest background color query");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let response = loop {
+            let response = responses.lock().expect("response buffer lock").clone();
+            if !response.is_empty() || Instant::now() >= deadline {
+                break response;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+
+        assert!(
+            std::str::from_utf8(&response)
+                .expect("terminal response utf8")
+                .contains("]11;"),
+            "expected OSC 11 terminal response, got {response:?}"
+        );
+        let _ = std::fs::remove_file(log_path);
+    }
 
     #[test]
     #[cfg_attr(
@@ -1280,6 +2158,33 @@ mod tests {
         windows,
         ignore = "portable-pty ConPTY EOF handling needs a dedicated Windows lifecycle test"
     )]
+    fn session_manager_lists_running_sessions() {
+        let log_dir = unique_log_dir();
+        let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
+        let mut request = StartSessionRequest::new(long_running_shell_command());
+        request.size = SessionSize {
+            rows: 6,
+            cols: 40,
+            pixel_width: 800,
+            pixel_height: 240,
+            dpi: 96,
+        };
+        let session_id = manager.start_session(request).expect("start session");
+
+        let sessions = manager.list_sessions().expect("list sessions");
+
+        assert!(sessions.contains(&session_id));
+        manager
+            .shutdown_session(session_id)
+            .expect("shutdown managed session");
+        let _ = std::fs::remove_dir_all(&log_dir);
+    }
+
+    #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "portable-pty ConPTY EOF handling needs a dedicated Windows lifecycle test"
+    )]
     fn session_manager_fans_out_session_events_to_subscribers() {
         let log_dir = unique_log_dir();
         let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
@@ -1365,6 +2270,131 @@ mod tests {
         let _ = std::fs::remove_dir_all(&log_dir);
     }
 
+    #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "portable-pty ConPTY EOF handling needs a dedicated Windows lifecycle test"
+    )]
+    fn full_event_buffer_drops_output_without_disconnect() {
+        let log_dir = unique_log_dir();
+        let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
+        let request = StartSessionRequest::new(long_running_shell_command());
+        let session_id = manager.start_session(request).expect("start session");
+        let subscriber = manager
+            .subscribe_session_events(session_id.clone())
+            .expect("subscribe client");
+
+        for index in 0..=EVENT_SUBSCRIBER_BUFFER {
+            let sessions = manager.sessions().expect("lock sessions");
+            let session = sessions.get(&session_id).expect("managed session");
+            session
+                .actor
+                .broadcast_event(SessionEvent::Output {
+                    session_id: session_id.clone(),
+                    output_seq: index as u64,
+                    bytes: format!("burst-{index}").into_bytes(),
+                })
+                .expect("broadcast output");
+        }
+
+        for _ in 0..EVENT_SUBSCRIBER_BUFFER {
+            let _ = subscriber
+                .recv_timeout(Duration::from_secs(1))
+                .expect("drain queued output event");
+        }
+
+        {
+            let sessions = manager.sessions().expect("lock sessions");
+            let session = sessions.get(&session_id).expect("managed session");
+            session
+                .actor
+                .broadcast_event(SessionEvent::Output {
+                    session_id: session_id.clone(),
+                    output_seq: 999,
+                    bytes: b"still-subscribed".to_vec(),
+                })
+                .expect("broadcast sentinel output");
+        }
+
+        wait_for_output_event(&subscriber, &session_id, "still-subscribed");
+        manager
+            .shutdown_session(session_id)
+            .expect("shutdown managed session");
+        let _ = std::fs::remove_dir_all(&log_dir);
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn dropped_event_subscribers_are_pruned_on_next_flush() {
+        let log_dir = unique_log_dir();
+        let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
+        let request = StartSessionRequest::new(long_running_shell_command());
+        let session_id = manager.start_session(request).expect("start session");
+        let subscriber = manager
+            .subscribe_session_events(session_id.clone())
+            .expect("subscribe client");
+        drop(subscriber);
+
+        {
+            let sessions = manager.sessions().expect("lock sessions");
+            let session = sessions.get(&session_id).expect("managed session");
+            session
+                .actor
+                .broadcast_event(SessionEvent::Output {
+                    session_id: session_id.clone(),
+                    output_seq: 1,
+                    bytes: b"after-disconnect".to_vec(),
+                })
+                .expect("broadcast output after subscriber disconnect");
+            assert_eq!(
+                session.actor.subscriber_count().expect("subscriber count"),
+                0
+            );
+        }
+
+        manager
+            .shutdown_session(session_id)
+            .expect("shutdown managed session");
+        let _ = std::fs::remove_dir_all(&log_dir);
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn full_event_buffer_replays_exit_after_subscriber_drains() {
+        let log_dir = unique_log_dir();
+        let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
+        let request = StartSessionRequest::new(long_running_shell_command());
+        let session_id = manager.start_session(request).expect("start session");
+        let subscriber = manager
+            .subscribe_session_events(session_id.clone())
+            .expect("subscribe client");
+
+        for index in 0..=EVENT_SUBSCRIBER_BUFFER {
+            let sessions = manager.sessions().expect("lock sessions");
+            let session = sessions.get(&session_id).expect("managed session");
+            session
+                .actor
+                .broadcast_event(SessionEvent::Output {
+                    session_id: session_id.clone(),
+                    output_seq: index as u64,
+                    bytes: format!("burst-{index}").into_bytes(),
+                })
+                .expect("broadcast output");
+        }
+
+        {
+            let sessions = manager.sessions().expect("lock sessions");
+            let session = sessions.get(&session_id).expect("managed session");
+            session
+                .actor
+                .write_input(b"exit\n".to_vec())
+                .expect("exit shell");
+        }
+
+        wait_for_exit_event(&subscriber, &session_id);
+        let _ = std::fs::remove_dir_all(&log_dir);
+    }
+
     fn unique_log_path() -> PathBuf {
         let unique = format!(
             "argus-pty-session-{}-{:?}.log",
@@ -1374,6 +2404,37 @@ mod tests {
         std::env::temp_dir().join(unique)
     }
 
+    fn test_output_state(log_path: &PathBuf, size: SessionSize) -> OutputState {
+        test_output_state_with_writer(log_path, size, Box::new(std::io::sink()))
+    }
+
+    fn test_output_state_with_writer(
+        log_path: &PathBuf,
+        size: SessionSize,
+        writer: Box<dyn Write + Send>,
+    ) -> OutputState {
+        let log = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(log_path)
+            .expect("open test log");
+        let writer = shared_pty_writer(writer);
+        OutputState {
+            log,
+            terminal: Terminal::new(
+                terminal_size(&size),
+                Arc::new(ArgusTerminalConfig),
+                "Argus",
+                env!("CARGO_PKG_VERSION"),
+                Box::new(TerminalOutputSink { writer }),
+            ),
+            cwd_sequence_buffer: Vec::new(),
+            bytes_logged: 0,
+            output_seq: 0,
+        }
+    }
+
     fn unique_log_dir() -> PathBuf {
         let unique = format!(
             "argus-session-manager-{}-{:?}",
@@ -1381,6 +2442,24 @@ mod tests {
             std::thread::current().id()
         );
         std::env::temp_dir().join(unique)
+    }
+
+    struct RecordingWriter {
+        bytes: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl Write for RecordingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.bytes
+                .lock()
+                .map_err(|_| std::io::Error::other("recording writer lock poisoned"))?
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
 
     #[cfg(windows)]
@@ -1506,7 +2585,8 @@ mod tests {
                 .recv_timeout(remaining.min(Duration::from_millis(100)))
                 .unwrap_or_else(|error| {
                     panic!("event stream ended while waiting for output marker {marker}: {error}")
-                });
+                })
+                .event;
             if let SessionEvent::Output {
                 session_id: event_session_id,
                 bytes,
@@ -1565,10 +2645,15 @@ mod tests {
             }
 
             match receiver.recv_timeout(remaining.min(Duration::from_millis(20))) {
-                Ok(SessionEvent::Exited {
-                    session_id: event_session_id,
-                    ..
-                }) if &event_session_id == session_id => {
+                Ok(envelope)
+                    if matches!(
+                        envelope.event,
+                        SessionEvent::Exited {
+                            session_id: ref event_session_id,
+                            ..
+                        } if event_session_id == session_id
+                    ) =>
+                {
                     panic!("received duplicate exit event for session {session_id}");
                 }
                 Ok(_) => {}
@@ -1589,7 +2674,7 @@ mod tests {
             let remaining = deadline.saturating_duration_since(Instant::now());
             assert!(!remaining.is_zero(), "timed out waiting for {label}");
             match receiver.recv_timeout(remaining.min(Duration::from_millis(100))) {
-                Ok(event) if matches_event(&event) => return event,
+                Ok(envelope) if matches_event(&envelope.event) => return envelope.event,
                 Ok(_) => {}
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {

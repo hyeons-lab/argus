@@ -273,7 +273,7 @@ Daemon-first. Local navigation first. Remote access once the local product is wo
 
 ### Phase 3: Local API + IPC
 - [ ] Define the daemon's session API (Rust trait + types) — the source of truth all transports bind to.
-- [ ] Local Unix socket adapter exposing the API.
+- [x] Local Unix socket adapter exposing the API.
 - [ ] In-process channel for the embedded TUI (zero-IPC path, same trait).
 - [ ] Multi-client semantics: many attaches per session, all see output, one active input lease per session.
 

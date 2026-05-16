@@ -64,6 +64,7 @@
 - Relaxed scrolled-back styled-row refreshes to accept newer daemon style responses for stable history ranges, preserving colors while output continues below the visible scrollback window.
 - Resized every open, non-exited TUI session after a terminal resize so inactive PTYs do not keep stale rows and columns.
 - Addressed follow-up PR review feedback by sanitizing embedded bracketed-paste end markers, refreshing the selected snapshot before paste, preserving selected trailing spaces, rejecting stale styled-row responses, clearing overlong unterminated OSC 7 buffers, making cursor visibility explicit, and removing dead attach/render parameters.
+- Added focused regression coverage showing dropped event subscribers are pruned on the next actor flush and overlong aborted OSC 7 cwd payloads do not poison later cwd updates.
 
 ## Commits
 - 472806b — feat: make TUI daemon-first
@@ -76,7 +77,8 @@
 - aab5126 — fix: preserve exited session colors
 - f67b7ac — fix: address daemon TUI review feedback
 - aba5835 — fix: improve daemon TUI scrollback responsiveness
-- HEAD — fix: address TUI review follow-ups
+- 1bcc739 — fix: address TUI review follow-ups
+- HEAD — test: cover daemon review edge cases
 
 ## Progress
 - 2026-05-14T18:00-0700 — Created `feat/daemon-first-tui` worktree from `origin/main`, unset the accidental upstream, and inspected the current TUI socket fallback.
@@ -154,3 +156,5 @@
 - 2026-05-15T21:33-0700 — Validation passed: `cargo fmt --all -- --check`, `/home/dberrios/.cargo/bin/cargo test -p argus-tui default_shell`, and `/home/dberrios/.cargo/bin/cargo test -p argus-tui`.
 - 2026-05-15T22:34-0700 — Addressed unresolved PR review feedback by sanitizing bracketed paste payload terminators, refreshing paste-time snapshot state, preserving selected trailing whitespace, requiring styled-row responses to match the cached output sequence, clearing overlong unterminated OSC 7 cwd buffers, and removing dead attach/render parameters.
 - 2026-05-15T22:34-0700 — Validation passed: `cargo fmt --all -- --check`, `cargo check -p argus-daemon -p argus-tui`, `cargo test -p argus-tui paste_input --locked`, `cargo test -p argus-tui terminal_selection --locked`, `cargo test -p argus-tui ensure_selected_styled_rows --locked`, `cargo test -p argus-daemon output_state_bounds_unterminated_osc7_working_directory --locked`, `cargo clippy -p argus-daemon -p argus-tui --all-targets --all-features --locked -- -D warnings`, and `cargo test -p argus-tui -p argus-daemon --locked`.
+- 2026-05-15T23:13-0700 — Added review-follow-up daemon regression tests for dead event subscriber pruning and recovery after aborting an overlong unterminated OSC 7 cwd sequence.
+- 2026-05-15T23:13-0700 — Validation passed: `cargo fmt --all -- --check`, `cargo test -p argus-daemon output_state_recovers_after_aborting_overlong_osc7_working_directory --locked`, `cargo test -p argus-daemon dropped_event_subscribers_are_pruned_on_next_flush --locked`, `/home/dberrios/.cargo/bin/cargo test -p argus-daemon --locked`, and `cargo clippy -p argus-daemon --all-targets --all-features --locked -- -D warnings`.

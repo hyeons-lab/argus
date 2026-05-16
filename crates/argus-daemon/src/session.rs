@@ -426,6 +426,15 @@ impl SessionActor {
         recv_actor_result(rx, "subscribing to session events")
     }
 
+    #[cfg(test)]
+    fn subscriber_count(&self) -> Result<usize> {
+        let (tx, rx) = mpsc::channel();
+        self.tx
+            .send(ActorCommand::SubscriberCount { response: tx })
+            .context("sending session subscriber count command")?;
+        recv_actor_result(rx, "counting session event subscribers")
+    }
+
     pub fn broadcast_event(&self, event: SessionEvent) -> Result<()> {
         let (tx, rx) = mpsc::channel();
         self.tx
@@ -579,6 +588,10 @@ enum ActorCommand {
         after_event_seq: Option<u64>,
         response: Sender<ActorResult<SessionEventReceiver>>,
     },
+    #[cfg(test)]
+    SubscriberCount {
+        response: Sender<ActorResult<usize>>,
+    },
     BroadcastEvent {
         event: SessionEvent,
         response: Sender<ActorResult<()>>,
@@ -699,6 +712,12 @@ impl ActorState {
                 response,
             } => {
                 let _ = response.send(self.subscribe_events(after_event_seq));
+                false
+            }
+            #[cfg(test)]
+            ActorCommand::SubscriberCount { response } => {
+                self.flush_subscribers();
+                let _ = response.send(Ok(self.subscribers.len()));
                 false
             }
             ActorCommand::BroadcastEvent { event, response } => {
@@ -1189,6 +1208,10 @@ fn reject_command_during_shutdown(command: ActorCommand) {
         ActorCommand::SubscribeEvents { response, .. } => {
             let _ = response.send(Err(error));
         }
+        #[cfg(test)]
+        ActorCommand::SubscriberCount { response } => {
+            let _ = response.send(Err(error));
+        }
         ActorCommand::BroadcastEvent { response, .. } => {
             let _ = response.send(Err(error));
         }
@@ -1547,6 +1570,26 @@ mod tests {
             .expect("ingest unterminated OSC 7 payload");
 
         assert!(output.cwd_sequence_buffer.is_empty());
+        let _ = std::fs::remove_file(log_path);
+    }
+
+    #[test]
+    fn output_state_recovers_after_aborting_overlong_osc7_working_directory() {
+        let log_path = unique_log_path();
+        let mut output = test_output_state(&log_path, SessionSize::default());
+
+        output
+            .ingest(b"\x1b]7;file://host/")
+            .expect("ingest partial OSC 7");
+        output
+            .ingest(&vec![b'a'; MAX_OSC_BUFFER * 2])
+            .expect("ingest overlong unterminated OSC 7 payload");
+
+        let cwd = output
+            .ingest(b"\x1b]7;file://host/tmp/recovered\x07")
+            .expect("ingest next OSC 7");
+
+        assert_eq!(cwd, Some(PathBuf::from("/tmp/recovered")));
         let _ = std::fs::remove_file(log_path);
     }
 
@@ -2274,6 +2317,41 @@ mod tests {
         }
 
         wait_for_output_event(&subscriber, &session_id, "still-subscribed");
+        manager
+            .shutdown_session(session_id)
+            .expect("shutdown managed session");
+        let _ = std::fs::remove_dir_all(&log_dir);
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn dropped_event_subscribers_are_pruned_on_next_flush() {
+        let log_dir = unique_log_dir();
+        let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
+        let request = StartSessionRequest::new(long_running_shell_command());
+        let session_id = manager.start_session(request).expect("start session");
+        let subscriber = manager
+            .subscribe_session_events(session_id.clone())
+            .expect("subscribe client");
+        drop(subscriber);
+
+        {
+            let sessions = manager.sessions().expect("lock sessions");
+            let session = sessions.get(&session_id).expect("managed session");
+            session
+                .actor
+                .broadcast_event(SessionEvent::Output {
+                    session_id: session_id.clone(),
+                    output_seq: 1,
+                    bytes: b"after-disconnect".to_vec(),
+                })
+                .expect("broadcast output after subscriber disconnect");
+            assert_eq!(
+                session.actor.subscriber_count().expect("subscriber count"),
+                0
+            );
+        }
+
         manager
             .shutdown_session(session_id)
             .expect("shutdown managed session");
